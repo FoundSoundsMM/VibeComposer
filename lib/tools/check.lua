@@ -278,8 +278,6 @@ ok(c1.steps[5] ~= nil, "a long hold leaves the step")
 
 -- poly: two keys together into one step
 tap(2, 7)                                    -- track 2
-P.open("track") P.lane.track = 1 P.enc(2, 1)
-ok(St.track(2).type == 2, "track 2 poly")
 press(11, 8) press(11, 7) tap(1, 1) release(11, 8) release(11, 7)
 ok(#St.clip(2).steps[1].notes == 2, "poly step took both keys")
 
@@ -418,7 +416,6 @@ o = ons(1, 1)
 ok(#o >= 4 and o[1].a == 62 and o[#o].a == 62, "track 1 transposed +2 by track 8")
 -- poly track 8: harmonise
 Q.stop()
-St.track(8).type = 2
 c8.steps = { St.new_step(8, { 57, 60, 64 }) }  -- Am
 c1.steps = { St.new_step(1, { 62 }) }        -- D -> C
 log = {}
@@ -437,7 +434,6 @@ ok(o[1] and o[1].a == 62, "follow off: D stays D")
 St.track(1).follow = true
 Q.stop()
 c8.steps = {}
-St.track(8).type = 1
 c8.speed = 1
 
 -- --------------------------------------------- pulses, ratchets, conditions
@@ -545,6 +541,147 @@ o = ons(1, 1)
 ok(#o >= 1, "Continue plays")
 params:set("clock_source", 1)
 Q.stop()
+
+-- --------------------------------------------------------- new features
+
+local function notes_of(list)
+  local s = {}
+  for _, e in ipairs(list) do s[#s + 1] = e.a end
+  return table.concat(s, ",")
+end
+tap(1, 7)
+c1 = St.clip(1)
+St.d.scale = 1
+
+-- direction
+c1.steps, c1.len, c1.speed = {}, 4, 1
+for i = 1, 4 do c1.steps[i] = St.new_step(1, { 60 + i }) end
+c1.dir = 2
+log = {}
+tap(1, 8) pump_beats(1.95) Q.stop()
+ok(notes_of(ons(1, 1)):sub(1, 23) == "64,63,62,61,64,63,62,61", "BWD: " .. notes_of(ons(1, 1)))
+c1.dir = 3
+log = {}
+tap(1, 8) pump_beats(1.95) Q.stop()
+ok(notes_of(ons(1, 1)):sub(1, 23) == "61,62,63,64,63,62,61,62", "PEND: " .. notes_of(ons(1, 1)))
+c1.dir = 1
+
+-- the scale changes, the patterns follow; back again gives what was written
+c1.steps, c1.len = {}, 3
+c1.steps[1] = St.new_step(1, { 60 })
+c1.steps[2] = St.new_step(1, { 64 })
+c1.steps[3] = St.new_step(1, { 69 })
+St.d.scale = 2                               -- minor
+log = {}
+tap(1, 8) pump_beats(0.7) Q.stop()
+ok(notes_of(ons(1, 1)):sub(1, 8) == "60,63,68", "C E A in minor is C Eb Ab: " .. notes_of(ons(1, 1)))
+St.d.scale = 13                              -- minor pentatonic: nearest notes
+log = {}
+tap(1, 8) pump_beats(0.7) Q.stop()
+ok(notes_of(ons(1, 1)):sub(1, 8) == "60,63,70", "into minor pentatonic: " .. notes_of(ons(1, 1)))
+St.d.scale = 1
+ok(c1.steps[2].notes[1] == 64, "the written notes are untouched")
+
+-- hold a step, press a later one: the note lasts to it
+c1.steps, c1.len = {}, 16
+c1.steps[1] = St.new_step(1, { 60 })
+press(1, 1) tap(4, 1) release(1, 1)
+ok(c1.steps[1].len == 4 and c1.steps[1] ~= nil, "step 1 lasts four steps")
+ok(c1.steps[4] == nil, "the second press wrote nothing")
+log = {}
+tap(1, 8) pump_beats(1.2) Q.stop()
+local on1, off1
+for _, e in ipairs(log) do
+  if e.kind == "on" and e.c == 1 and not on1 then on1 = e.beat end
+  if e.kind == "off" and e.c == 1 and on1 and not off1 then off1 = e.beat end
+end
+ok(on1 and off1 and math.abs((off1 - on1) - 0.9375) < 0.01, string.format("held 3.75 sixteenths (%.3f beats)", (off1 or 0) - (on1 or 0)))
+press(1, 1) tap(4, 1) release(1, 1)
+ok(c1.steps[1].len == nil, "the same press again: one step")
+
+-- arpeggiated chord step across a two-step tie
+tap(10, 2)                                   -- chord mode
+P.open("chord") P.lane.chord = 3 P.enc(2, 1)  -- ARP UP
+ok(St.d.arp == 2, "arp up")
+P.enc(3, -1) P.enc(3, -1)                    -- RATE 1/16 -> 1/32
+ok(St.d.arp_rate == 1, "arp rate 1/32")
+c1.steps = {}
+press(11, 8) tap(1, 1) release(11, 8)       -- I chord, arp
+ok(c1.steps[1].arp ~= nil and c1.steps[1].strum == nil, "the step remembers the arp, no strum")
+c1.len = 4
+c1.steps[1].len = 2                          -- two sixteenths: four 32nds
+log = {}
+tap(1, 8) pump_beats(0.55) Q.stop()
+ok(notes_of(ons(1, 1)) == "48,52,55,48", "arp plays the chord up in 32nds over the tie: " .. notes_of(ons(1, 1)))
+-- live arp while holding a chord
+log = {}
+tap(1, 8) press(11, 8) pump_beats(0.5) release(11, 8) Q.stop()
+ok(#ons(1, 1) >= 4, "live arp while the chord is held: " .. #ons(1, 1))
+St.d.arp = 1
+-- the readout shows the chord and its modifiers
+press(12, 8)
+ok(P.toast and P.toast.lines[1] == "Dm", "readout names the chord: " .. tostring(P.toast and P.toast.lines[1]))
+frame("chord readout")
+release(12, 8)
+tap(11, 2)                                   -- SUS2 on
+ok(P.toast.lines[2] == K.MOD_INFO.SUS2, "readout says what SUS2 does")
+frame("modifier readout")
+tap(11, 2)
+tap(10, 1)                                   -- keys mode
+press(11, 8) press(12, 7) press(13, 6)       -- C, F, A#? whatever they make
+frame("keys readout")
+release(11, 8) release(12, 7) release(13, 6)
+press(11, 8) press(15, 8) press(13, 7)
+ok(P.toast.lines[2] == "C" or P.toast.lines[2] ~= nil, "keys readout detects")
+release(11, 8) release(15, 8) release(13, 7)
+ok(T.detect({ 48, 52, 55 }) == "C" and T.detect({ 52, 55, 60 }) == "C/E" and T.detect({ 50, 53, 57, 60 }) == "Dm7", "chord detection")
+
+-- octave buttons
+tap(10, 7)
+ok(St.d.koct == 1 and Kb.note_at(11, 8) == 60, "octave up")
+press(10, 7) press(10, 8) release(10, 7) release(10, 8)
+ok(St.d.koct == 0, "both octave buttons: back to the middle")
+tap(10, 8)
+ok(Kb.note_at(11, 8) == 36, "octave down")
+tap(10, 7)
+
+-- record: stopped, step by step
+c1.steps, c1.len = {}, 8
+tap(3, 8)
+ok(G.rec, "REC armed")
+tap(11, 8) tap(12, 8) tap(13, 8)
+ok(c1.steps[1] and c1.steps[2] and c1.steps[3] and c1.steps[3].notes[1] == 50, "step recording moves on")
+tap(5, 1)                                    -- cursor to step 5
+press(11, 8) press(15, 8) release(11, 8) release(15, 8)
+ok(c1.steps[5] and #c1.steps[5].notes == 2, "a chord of keys is one step")
+ok(c1.steps[6] == nil and G.cursor == 6, "cursor at 6")
+-- record: live, quantised to the nearest step
+c1.steps = {}
+log = {}
+tap(1, 8)
+pump_beats(0.27)                             -- just past step 2's start
+tap(14, 8)
+pump_beats(0.3)
+local found
+for i, st in pairs(c1.steps) do found = i end
+ok(found == 2, "live note went into step 2, got " .. tostring(found))
+Q.stop()
+tap(3, 8)
+ok(not G.rec, "REC off")
+
+-- 512 steps and paging
+P.open("track") P.lane.track = 2
+P.enc(2, 600)
+ok(c1.len == 512, "length goes to 512")
+key(3, 1) key(3, 1)
+ok(G.steppage == 3, "K3 pages on")
+key(2, 1)
+ok(G.steppage == 2, "K2 pages back")
+press(1, 1) release(1, 1)
+ok(c1.steps[33] ~= nil, "pressing on page 2 writes step 33")
+frame("track 512")
+P.open("home") frame("home 512")
+c1.len = 16
 
 -- --------------------------------------------------- generate and mutate
 

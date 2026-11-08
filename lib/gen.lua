@@ -5,9 +5,8 @@
 --
 -- GENERATE writes a new pattern. STYLE is where the hits go and how the
 -- notes move; DENSITY how many steps play; RANGE how many octaves up from
--- the root the notes can reach; POOL whether they come from the scale or
--- from the notes played last on the keyboard. A poly track gets the key's
--- chords instead of single notes.
+-- the root the notes can reach; POOL whether they come from the scale,
+-- from the notes played last on the keyboard, or are the key's chords.
 --
 -- MUTATE changes what is there: AMOUNT of the steps move a note a scale
 -- step or two (NOTES), slide to a neighbouring empty step (RHYTHM), or
@@ -56,7 +55,6 @@ end
 
 function Gn.generate(t)
   local g = St.d.gen
-  local tr = St.track(t)
   local c = St.clip(t)
   local pl = pool()
   local on = hits(g.style, c.len, g.density)
@@ -81,7 +79,7 @@ function Gn.generate(t)
         note = pl[math.random(#pl)]
       end
       local notes = { note }
-      if tr.type == 2 then
+      if g.pool == 3 then
         local d, _ = T.note_degree(note, St.d.root, St.d.scale)
         notes = T.chord({ base = St.d.root, scale = St.d.scale, deg = d, mods = {} })
       end
@@ -92,6 +90,7 @@ function Gn.generate(t)
 end
 
 local function shift_notes(st, n)
+  St.bake(st)
   for i, v in ipairs(st.notes) do
     st.notes[i] = math.min(math.max(T.shift_degrees(v, St.d.root, St.d.scale, n), 0), 127)
   end

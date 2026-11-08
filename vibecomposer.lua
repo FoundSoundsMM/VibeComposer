@@ -11,8 +11,8 @@
 --
 -- E1 lane / track
 -- E2 E3 left / right value
--- K2 steps 1-32 / 33-64
--- K3 home and back
+-- K2 / K3 step page back / on
+-- K1 home and back
 --
 -- see README
 
@@ -88,6 +88,8 @@ function init()
   P.init(St, Q, Kb, G, Gn, O)
   G.init(St, Q, Kb, N, Gn, P)
   N.on_load = function() Kb.release_all() end
+  Kb.show = P.show
+  Q.on_tick = Kb.arp_tick
 
   add_params()
   load_config()
@@ -142,10 +144,12 @@ end
 
 function key(n, z)
   if z ~= 1 then return end
-  if n == 2 then
-    G.steppage = (G.steppage == 1) and 2 or 1
-  elseif n == 3 then
+  if n == 1 then
     P.home_toggle()
+  elseif n == 2 then
+    G.page(-1)
+  else
+    G.page(1)
   end
   Q.dirty = true
 end

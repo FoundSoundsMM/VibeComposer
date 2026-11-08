@@ -6,12 +6,14 @@
 -- A track has four clips (Ableton-style slots). The clip that plays is
 -- tr.clips[tr.clip]; editing the steps edits that clip.
 --
--- A step is { notes = { midi notes }, and any of K.STEP_DEF's keys that
--- differ from the default }.
+-- A step is { notes = { midi notes }, sc = the scale they were written in,
+-- and any of K.STEP_DEF's keys that differ from the default }. Optional:
+-- len (a note held over that many steps), strum, arp.
 
 local K = include("lib/const")
 
 local St = {}
+St.T = include("lib/theory")
 
 function St.copy(v)
   if type(v) ~= "table" then return v end
@@ -20,15 +22,14 @@ function St.copy(v)
   return out
 end
 
-function St.new_clip(len, speed)
-  return { steps = {}, len = len or 16, speed = speed or 1 }
+function St.new_clip(len, speed, dir)
+  return { steps = {}, len = len or 16, speed = speed or 1, dir = dir or 1 }
 end
 
 function St.new_track(i)
   local clips = {}
   for c = 1, K.NCLIPS do clips[c] = St.new_clip() end
   return {
-    type = 1,           -- 1 mono, 2 poly
     swing = 0,          -- offset on the global swing, in percent
     dev = 1,            -- MIDI port (norns vport 1-16)
     ch = i,             -- MIDI channel
@@ -57,6 +58,9 @@ function St.new()
     cvel = 100,
     strum = 0,          -- ms between a chord's notes
     vlead = false,
+    koct = 0,           -- keyboard octave (G10 / H10)
+    arp = 1,            -- chord mode arpeggio: K.ARPS
+    arp_rate = 3,       -- K.ARP_RATES
     transpose = 1,      -- 1 chromatic, 2 in key
     mods = {},
     gen = { style = 1, density = 50, range = 2, pool = 1 },
@@ -89,6 +93,7 @@ end
 function St.new_step(t, notes)
   local st = St.copy(St.d.tracks[t].tpl)
   st.notes = notes
+  st.sc = St.d.scale
   return st
 end
 
@@ -98,7 +103,22 @@ function St.has_params(st)
   for k, def in pairs(K.STEP_DEF) do
     if st[k] ~= nil and st[k] ~= def then return true end
   end
-  return st.strum ~= nil
+  return st.strum ~= nil or st.arp ~= nil or (st.len or 1) > 1
+end
+
+-- the notes as they sound in the key's scale now (see T.remap)
+function St.notes(st)
+  local sc = St.d.scale
+  if not st.sc or st.sc == sc then return st.notes end
+  local out = {}
+  for i, n in ipairs(st.notes) do out[i] = St.T.remap(n, St.d.root, st.sc, sc) end
+  return out
+end
+
+-- before a step's notes are edited: write them down in the scale now
+function St.bake(st)
+  if st.notes then st.notes = St.notes(st) end
+  st.sc = St.d.scale
 end
 
 -- ----------------------------------------------------------------- disk
@@ -118,7 +138,10 @@ local function fill(d)
     for k, v in pairs(St.new_track(i)) do
       if tr[k] == nil then tr[k] = v end
     end
-    for c = 1, K.NCLIPS do tr.clips[c] = tr.clips[c] or St.new_clip() end
+    for c = 1, K.NCLIPS do
+      tr.clips[c] = tr.clips[c] or St.new_clip()
+      tr.clips[c].dir = tr.clips[c].dir or 1
+    end
     d.tracks[i] = tr
   end
   return d

@@ -4,18 +4,24 @@
 -- parameters: E1 picks the lane, E2 turns the left one, E3 the right.
 --
 --   HOME      every track at a glance (when no page is open)
---   TRACK     TYPE | SWING, LENGTH | SPEED
+--   TRACK     DIRECTION | SWING, LENGTH | SPEED
 --   TC1, TC2  trig conditions, Elektron-style
 --   TC3, TC4  Metropolix stages: pulses, gate modes, skip, ramp,
 --             accumulator, slide
 --   GEN, MUT  pattern generation and mutation
 --   KEYS      LAYOUT | ROOT, IN-KEY | VELOCITY
---   CHORD     ROOT | VELOCITY, STRUM | V.LEAD
+--   CHORD     ROOT | VELOCITY, STRUM | V.LEAD, ARP | RATE
 --   SETTINGS  SCALE | TEMPO, SWING | SIGNATURE, TRANSPOSE
 --   TRACK SETTINGS  DEVICE | CHANNEL, FOLLOW | MUTE, OCTAVE | PROGRAM
 --
 -- On the TC pages, with steps held, E2 and E3 change those steps. With
 -- none held they change what a NEW step starts with.
+--
+-- THE READOUT. Playing the keyboard, a chord or a modifier, setting a
+-- note's length or arming RECORD shows what it did in place of the lanes:
+-- the notes and the chord they make, the chord's name, notes and
+-- modifiers, or what a modifier does. It stays while pads are held and a
+-- moment after.
 
 local K = include("lib/const")
 local T = include("lib/theory")
@@ -91,12 +97,13 @@ local STEP_NOTE = {
   get = function()
     local ts, held = targets()
     if not held or not ts[1] then return "--" end
-    return T.notes_name(ts[1].notes)
+    return T.notes_name(St.notes(ts[1]))
   end,
   delta = function(d)
     local ts, held = targets()
     if not held then return end
     for _, st in ipairs(ts) do
+      St.bake(st)
       if St.d.inkey then Gn.shift_notes(st, sgn(d))
       else
         for i, n in ipairs(st.notes) do st.notes[i] = clamp(n + sgn(d), 0, 127) end
@@ -114,13 +121,13 @@ DEFS.track = {
   title = function() return "TRACK " .. sel() end,
   info = function()
     local s = (sel() == K.MASTER) and "MASTER" or ("CLIP " .. tr().clip)
-    if G.steppage == 2 then s = s .. " 33-64" end
+    if G.pages() > 1 then s = s .. " P" .. G.steppage .. "/" .. G.pages() end
     return s
   end,
   lanes = {
     {
-      { name = "TYPE", get = function() return (tr().type == 1) and "MONO" or "POLY" end,
-        delta = function(d) tr().type = clamp(tr().type + sgn(d), 1, 2) end },
+      { name = "DIRECTION", get = function() return K.DIRS[clip().dir or 1] end,
+        delta = function(d) clip().dir = clamp((clip().dir or 1) + sgn(d), 1, #K.DIRS) end },
       { name = "SWING",
         get = function()
           local e = clamp(St.d.swing + tr().swing, 50, 75)
@@ -148,7 +155,23 @@ DEFS.tc1 = {
   lanes = {
     { sp("COND", "cond", 1, #K.CONDS, function(v) return K.CONDS[v] end),
       sp("PROB", "prob", 0, 100, pct) },
-    { sp("VEL", "vel", 1, 127, plain), sp("GATE", "gate", 1, 100, pct) },
+    { sp("VEL", "vel", 1, 127, plain),
+      { name = "GATE",
+        get = function()
+          local ts = targets()
+          if not ts[1] then return "--" end
+          if (ts[1].len or 1) > 1 then return ts[1].len .. " STEPS" end
+          return St.get(ts[1], "gate") .. "%"
+        end,
+        delta = function(d)
+          local ts, held = targets()
+          for _, st in ipairs(ts) do
+            -- turning the gate is back to a one-step note
+            st.len = nil
+            st.gate = clamp(St.get(st, "gate") + d, 1, 100)
+          end
+          if held then G.mark_used() end
+        end } },
   },
 }
 
@@ -233,9 +256,15 @@ local ROOT = {
   end,
 }
 
+local function oct_info()
+  local o = St.d.koct or 0
+  if o == 0 then return "" end
+  return "OCT " .. signed(o) .. " "
+end
+
 DEFS.keys = {
   title = function() return "KEYS" end,
-  info = function() return K.SCALES[St.d.scale].name end,
+  info = function() return oct_info() .. K.SCALES[St.d.scale].name end,
   lanes = {
     {
       { name = "LAYOUT", get = function() return K.LAYOUTS[St.d.layout].name end,
@@ -259,7 +288,7 @@ DEFS.keys = {
 
 DEFS.chord = {
   title = function() return "CHORD" end,
-  info = function() return Kb.chord_name or K.SCALES[St.d.scale].name end,
+  info = function() return oct_info() .. (Kb.chord_name or K.SCALES[St.d.scale].name) end,
   lanes = {
     {
       ROOT,
@@ -267,10 +296,23 @@ DEFS.chord = {
         delta = function(d) St.d.cvel = clamp(St.d.cvel + d, 1, 127) end },
     },
     {
-      { name = "STRUM", get = function() return (St.d.strum == 0) and "OFF" or (St.d.strum .. "ms") end,
+      { name = "STRUM",
+        get = function()
+          if (St.d.arp or 1) > 1 then return "ARP" end
+          return (St.d.strum == 0) and "OFF" or (St.d.strum .. "ms")
+        end,
         delta = function(d) St.d.strum = clamp(St.d.strum + (d * 5), 0, 250) end },
       { name = "V.LEAD", get = function() return onoff(St.d.vlead) end,
         delta = function(d) St.d.vlead = d > 0 end },
+    },
+    {
+      { name = "ARP", get = function() return K.ARPS[St.d.arp or 1] end,
+        delta = function(d)
+          Kb.release_all()
+          St.d.arp = clamp((St.d.arp or 1) + sgn(d), 1, #K.ARPS)
+        end },
+      { name = "RATE", get = function() return K.ARP_RATES[St.d.arp_rate or 3].name end,
+        delta = function(d) St.d.arp_rate = clamp((St.d.arp_rate or 3) + sgn(d), 1, #K.ARP_RATES) end },
     },
   },
 }
@@ -388,7 +430,30 @@ function P.enc(n, d)
   Q.dirty = true
 end
 
--- K3: home and back
+-- the readout: lines = { big, second, third, hold = still held }, or nil
+-- when what was held comes up (it then fades after a moment)
+P.toast = nil
+local TOAST = 1.5
+
+function P.show(lines)
+  if lines then
+    P.toast = { lines = lines, hold = lines.hold, t = util.time() }
+  elseif P.toast then
+    P.toast.hold = false
+    P.toast.t = util.time()
+  end
+  Q.dirty = true
+end
+
+local function toast_live()
+  local t = P.toast
+  if not t then return false end
+  if t.hold or (util.time() - t.t) < TOAST then return true end
+  P.toast = nil
+  return false
+end
+
+-- K1: home and back
 function P.home_toggle()
   if P.page == "home" then
     if G.settings then P.open("settings") else P.open(P.last or "track") end
@@ -484,9 +549,13 @@ local function draw_home()
       end
     end
     local range = math.max(hi - lo, 1)
+    -- a long clip: one mark per pixel column is plenty
+    local drawn = -1
     for i = 1, c.len do
       local st = c.steps[i]
       local x = x0 + ((i - 1) * w)
+      local px = math.floor(x)
+      if px == drawn and rt.ph ~= i then st = nil end
       if (Q.playing or Q.paused) and rt.ph == i then
         screen.level(3)
         screen.rect(math.floor(x), y, math.max(1, math.floor(w)), 6)
@@ -495,8 +564,9 @@ local function draw_home()
       if St.has_notes(st) then
         local yy = y + 5 - math.floor(((st.notes[1] - lo) / range) * 4 + 0.5)
         screen.level((rt.ph == i and Q.playing) and 15 or (trk.mute and 2 or 7))
-        screen.rect(math.floor(x), yy, math.max(1, math.floor(w) - 1), 1)
+        screen.rect(px, yy, math.max(1, math.floor(w) - 1), 1)
         screen.fill()
+        drawn = px
       end
     end
     if rt.last and #rt.last > 0 then
@@ -508,12 +578,25 @@ local function draw_home()
   end
 end
 
+-- the readout over the page: the page's title stays, the rest is the news
+local function draw_toast()
+  local def = DEFS[P.page]
+  if P.page == "home" or not def then header("VIBE COMPOSER", "T" .. G.sel)
+  else header(def.title(), "") end
+  local l = P.toast.lines
+  local big = l[1] or ""
+  if #big <= 12 then txt(0, 32, big, 15, 16) else txt(0, 28, big, 15) end
+  if l[2] and l[2] ~= "" then txt(0, 46, l[2], 8) end
+  if l[3] and l[3] ~= "" then txt(0, 58, l[3], 4) end
+end
+
 function P.redraw()
   screen.clear()
   screen.aa(0)
   screen.line_width(1)
   local def = DEFS[P.page]
-  if P.page == "home" or not def then draw_home()
+  if toast_live() then draw_toast()
+  elseif P.page == "home" or not def then draw_home()
   else draw_page(def, P.page) end
   screen.update()
 end

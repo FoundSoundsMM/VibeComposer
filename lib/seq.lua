@@ -103,6 +103,7 @@ function Q.reset_track(t, line)
   local rt = Q.rt[t]
   rt.pos, rt.pulse, rt.npulses, rt.loop = 0, 1, 1, 0
   rt.pass, rt.pre, rt.k = false, false, 0
+  rt.pdir, rt.count = 1, 0
   rt.accs, rt.acc_off = {}, 0
   rt.next_line = line or 0
   rt.ph = 0
@@ -121,16 +122,68 @@ function Q.init(state, out)
   Q.reset_tracks()
 end
 
+-- DIRECTION. One pass of the pattern (what A:B and 1ST count) is a lap for
+-- FWD and BWD, there and back for PEND, and LENGTH steps for WALK and RND.
+local function step_once(rt, c)
+  local len = c.len
+  local d = K.DIRS[c.dir or 1] or "FWD"
+  local pos = math.min(rt.pos, len)
+  if d == "BWD" then
+    if pos <= 1 then
+      if rt.pos ~= 0 then rt.loop = rt.loop + 1 end
+      return len
+    end
+    return pos - 1
+  elseif d == "PEND" then
+    if pos == 0 then
+      rt.pdir = 1
+      return 1
+    end
+    if len <= 1 then
+      rt.loop = rt.loop + 1
+      return 1
+    end
+    local n = pos + rt.pdir
+    if n > len then
+      rt.pdir = -1
+      n = len - 1
+    elseif n < 1 then
+      rt.pdir = 1
+      n = 2
+    end
+    if n == 1 then rt.loop = rt.loop + 1 end
+    return n
+  elseif d == "WALK" or d == "RND" then
+    local n
+    if pos == 0 then n = (d == "RND") and math.random(len) or 1
+    elseif d == "RND" then n = math.random(len)
+    else
+      local r = math.random()
+      n = pos + ((r < 0.5) and 1 or ((r < 0.75) and -1 or 0))
+      if n > len then n = 1 elseif n < 1 then n = len end
+    end
+    if pos ~= 0 then
+      rt.count = rt.count + 1
+      if rt.count >= len then
+        rt.count = 0
+        rt.loop = rt.loop + 1
+      end
+    end
+    return n
+  end
+  if pos + 1 > len then
+    if rt.pos ~= 0 then rt.loop = rt.loop + 1 end
+    return 1
+  end
+  return pos + 1
+end
+
 -- the next step: skipped steps take no time
 local function next_pos(rt, c)
-  local len = c.len
   local p = rt.pos
-  for _ = 1, len do
-    p = p + 1
-    if p > len then
-      p = 1
-      rt.loop = rt.loop + 1
-    end
+  for _ = 1, c.len do
+    p = step_once(rt, c)
+    rt.pos = p
     if St.get(c.steps[p], "skip") == 0 then return p end
   end
   return p
@@ -236,15 +289,12 @@ local function prune_hist(t)
   end
 end
 
--- a step's notes as this track plays them
-local function step_notes(tr, st, acc)
+-- a step's notes as they play: in the key's scale now, plus the step's
+-- octave and its accumulator
+local function step_notes(st, acc)
   local add = (St.get(st, "oct") * 12) + acc
   local out = {}
-  if tr.type == 1 then
-    out[1] = st.notes[1] + add
-  else
-    for i, n in ipairs(st.notes) do out[i] = n + add end
-  end
+  for i, n in ipairs(St.notes(st)) do out[i] = n + add end
   return out
 end
 
@@ -295,7 +345,7 @@ local function prepare(t, L, silent)
       rt.accs[pos] = cnt + 1
       rt.acc_off = St.get(st, "acc") * (cnt % math.max(1, St.get(st, "limit")))
       if t == K.MASTER then
-        Q.set_master(L, { kind = tr.type, notes = step_notes(tr, st, rt.acc_off) })
+        Q.set_master(L, { notes = step_notes(st, rt.acc_off) })
       end
     end
   end
@@ -315,7 +365,25 @@ local function prepare(t, L, silent)
   local gate = St.get(st, "gate") / 100
   local slide = St.get(st, "slide") == 1
   local base = St.get(st, "vel")
-  local notes = step_notes(tr, st, rt.acc_off)
+  local notes = step_notes(st, rt.acc_off)
+  local tie = st.len or 1
+
+  -- an arpeggio across the step (and across its tie, if it has one)
+  if st.arp and #notes > 1 then
+    local rate = (K.ARP_RATES[st.arp.rate] or K.ARP_RATES[3]).t
+    local order = T.arp_order(notes, st.arp.mode)
+    local dur = (tie > 1) and (tie * dv) or span
+    local j = 0
+    while (j * rate) < dur - 1e-6 do
+      local note = (st.arp.mode == 5) and order[math.random(#order)] or order[(j % #order) + 1]
+      local o = math.max(at + micro + (j * rate), Q.t)
+      local rec = { t = t, line = L, note = note, vel = clamp(math.floor((base * vf) + 0.5), 1, 127) }
+      push({ at = o, kind = 1, rec = rec })
+      push({ at = o + math.max(0.2, rate * gate), kind = 0, rec = rec })
+      j = j + 1
+    end
+    return
+  end
 
   -- strum: the chord's notes one after another, up, down or shuffled
   local gap = 0
@@ -340,7 +408,10 @@ local function prepare(t, L, silent)
     local vel = clamp(math.floor((base * vf * vr) + 0.5), 1, 127)
     local on = math.max(at + micro + (i * sub), Q.t)
     local len
-    if slide and i == r - 1 then
+    if tie > 1 and r == 1 then
+      -- held over steps (hold a step, press a later one)
+      len = ((tie - 1) * dv) + (slide and (dv + 0.5) or (dv * gate))
+    elseif slide and i == r - 1 then
       len = (span - (i * sub)) + 0.5   -- past the next note on: legato
     else
       len = math.max(0.2, sub * gate)
@@ -359,6 +430,7 @@ end
 local function fire(e)
   if e.kind == 2 then
     Q.rt[e.t].ph = e.pos
+    Q.rt[e.t].ph_line = e.line
     Q.dirty = true
   elseif e.kind == 1 then
     local rec = e.rec
@@ -466,6 +538,7 @@ function Q.tick_abs(x)
     local t = x - Q.origin
     if t > Q.t then Q.process(t) end
   end
+  if Q.on_tick then Q.on_tick(x) end
 end
 
 function Q.run()
@@ -655,6 +728,20 @@ function Q.on_bar(fn)
   end
   Q.pending = { at = Q.next_bar(Q.t + Q.la_max()), fn = fn }
   Q.dirty = true
+end
+
+-- RECORD: the step a note played now belongs to. Past the middle of the
+-- step that is playing, it is the next one (it plays on the next pass).
+function Q.rec_step(t)
+  local rt, c = Q.rt[t], St.clip(t)
+  if rt.ph == 0 or not rt.ph_line then return 1 end
+  local dv = c.speed * K.T16
+  if (Q.t - rt.ph_line) >= (dv / 2) then
+    local back = K.DIRS[c.dir or 1] == "BWD"
+    if back then return ((rt.ph - 2) % c.len) + 1 end
+    return (rt.ph % c.len) + 1
+  end
+  return math.min(rt.ph, c.len)
 end
 
 -- bar.beat.sixteenth of the song, for the screen

@@ -9,7 +9,7 @@ K.NTRACKS = 8
 K.MASTER = 8          -- track 8 transposes or harmonises the others
 K.NCLIPS = 4
 K.NSNAPS = 48
-K.MAXLEN = 64
+K.MAXLEN = 512        -- 16 pages of 32
 K.PAGE_STEPS = 32     -- rows A-D x columns 1-8
 K.PPQ = 24            -- MIDI clock ticks per beat; everything runs on them
 K.T16 = 6             -- ticks in a sixteenth
@@ -30,6 +30,9 @@ K.BTN = {
   MUT  = { 8, 6 },
   PLAY = { 1, 8 },
   STOP = { 2, 8 },
+  REC  = { 3, 8 },
+  OCTUP = { 10, 7 },
+  OCTDN = { 10, 8 },
   SET  = { 8, 8 },
 }
 
@@ -64,8 +67,7 @@ end
 -- ------------------------------------------------------- time signatures
 --
 -- A bar is the sum of its groups, in sixteenths. The groups are where the
--- grid's dim beat markers fall. No bar is longer than the 64 steps a track
--- can hold.
+-- grid's dim beat markers fall.
 
 K.SIGS = {
   { name = "4/4",  g = { 4, 4, 4, 4 } },
@@ -111,6 +113,9 @@ for b = 2, 8 do
   for a = 1, b do K.CONDS[#K.CONDS + 1] = a .. ":" .. b end
 end
 
+-- the order a track walks its steps in
+K.DIRS = { "FWD", "BWD", "PEND", "WALK", "RND" }
+
 -- Metropolix-style gate modes for a step that owns several pulses
 K.MODES = { "REPEAT", "HOLD", "SINGLE", "REST" }
 
@@ -146,10 +151,36 @@ function K.mod_at(row, col)
   return g, r.ids[col]
 end
 
+-- what each modifier does, for the screen
+K.MOD_GROUPS = { ext = "EXTENSION", type = "QUALITY", inv = "VOICING", oct = "OCTAVE",
+  bor = "BORROWED", strum = "STRUM", omit = "OMIT" }
+K.MOD_INFO = {
+  ["7"] = "adds the 7th", M7 = "adds a major 7th", ["9"] = "adds 7th and 9th",
+  ["11"] = "adds 7th 9th 11th", ["13"] = "adds 7th 9th 13th", ["6"] = "adds the 6th",
+  SUS2 = "3rd becomes a 2nd", SUS4 = "3rd becomes a 4th", MAJ = "forces major",
+  MIN = "forces minor", DIM = "diminished", AUG = "augmented",
+  INV1 = "1st inversion", INV2 = "2nd inversion", INV3 = "3rd inversion",
+  DROP2 = "2nd from top drops", DROP3 = "3rd from top drops", SPRD = "open, spread out",
+  ["-2"] = "two octaves down", ["-1"] = "an octave down", ["+1"] = "an octave up",
+  ["+2"] = "two octaves up", BASS = "root an octave below", TOP = "root an octave above",
+  PAR = "from the parallel key", ["V/"] = "its own dominant 7", ["vii/"] = "its leading dim7",
+  bII = "major, a semitone up", TT = "tritone sub dom 7", DOM7 = "forced dominant 7",
+  UP = "strums upward", DOWN = "strums downward", RAND = "strums shuffled",
+  ["NO R"] = "leaves out the root", ["NO 3"] = "leaves out the 3rd", ["NO 5"] = "leaves out the 5th",
+}
+
+-- ------------------------------------------------------------ arpeggio
+
+K.ARPS = { "OFF", "UP", "DOWN", "UPDN", "RAND" }
+K.ARP_RATES = {
+  { name = "1/32", t = 3 }, { name = "1/16T", t = 4 }, { name = "1/16", t = 6 },
+  { name = "1/8T", t = 8 }, { name = "1/8", t = 12 }, { name = "1/4", t = 24 },
+}
+
 -- ------------------------------------------------------------ generator
 
 K.GEN_STYLES = { "EUCLID", "RANDOM", "ARP UP", "ARP RND", "WALK", "BASS" }
-K.GEN_POOLS = { "SCALE", "LAST" }
+K.GEN_POOLS = { "SCALE", "LAST", "CHORDS" }
 K.MUT_TARGETS = { "NOTES", "RHYTHM", "BOTH" }
 
 -- --------------------------------------------------------- step defaults

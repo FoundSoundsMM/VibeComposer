@@ -56,15 +56,14 @@ end
 
 -- ----------------------------------------------------------------- follow
 --
--- m is what track 8 last played: { kind = 1 (mono) or 2 (poly), notes }.
--- MONO transposes by how far track 8's note sits from the keyboard root,
--- chromatically or by scale steps. POLY pulls each note to the nearest tone
--- of track 8's chord, keeping its register, so the line moves with the
--- harmony instead of jumping.
+-- m is what track 8 last played: { notes }. A single note transposes by
+-- how far it sits from the keyboard root, chromatically or by scale steps.
+-- A chord pulls each note to the nearest tone of that chord, keeping its
+-- register, so the line moves with the harmony instead of jumping.
 
 function T.follow(note, m, d)
   if not (m and m.notes and m.notes[1]) then return note end
-  if m.kind == 2 then
+  if #m.notes > 1 then
     local best, bd = note, 99
     for _, cn in ipairs(m.notes) do
       local pc = cn % 12
@@ -85,6 +84,29 @@ function T.follow(note, m, d)
     return T.shift_degrees(note, d.root, d.scale, dm)
   end
   return note + (mn - d.root)
+end
+
+-- ------------------------------------------------------------- re-scale
+--
+-- A step remembers the scale it was written in. When the key's scale
+-- changes, its notes are played in the new one: scale step for scale step
+-- between scales of the same size (C major's E is C minor's Eb), the
+-- nearest note of the new scale otherwise. The stored notes never change,
+-- so going back to the old scale gives back exactly what was written.
+
+function T.remap(note, root, from, to)
+  if not from or from == to then return note end
+  local a, b = T.iv(from), T.iv(to)
+  if #b == 12 then return note end
+  if #a == #b then
+    local d, rem = T.note_degree(note, root, from)
+    return T.degree_note(root, to, d) + rem
+  end
+  for off = 0, 6 do
+    if T.in_scale(note - off, root, to) then return note - off end
+    if T.in_scale(note + off, root, to) then return note + off end
+  end
+  return note
 end
 
 -- ----------------------------------------------------------------- chords
@@ -216,6 +238,69 @@ function T.chord_name(r, tones)
   elseif has["7"] then q = q .. ((has["7"] == 11) and "M7" or "7")
   elseif has["6"] then q = q .. "6" end
   return K.NOTE_NAMES[(r % 12) + 1] .. q
+end
+
+-- what chord a set of notes is, from any of them as the root
+local SHAPES = {
+  { "", { 0, 4, 7 } }, { "m", { 0, 3, 7 } }, { "dim", { 0, 3, 6 } }, { "aug", { 0, 4, 8 } },
+  { "sus2", { 0, 2, 7 } }, { "sus4", { 0, 5, 7 } }, { "5", { 0, 7 } },
+  { "7", { 0, 4, 7, 10 } }, { "M7", { 0, 4, 7, 11 } }, { "m7", { 0, 3, 7, 10 } },
+  { "mM7", { 0, 3, 7, 11 } }, { "m7b5", { 0, 3, 6, 10 } }, { "dim7", { 0, 3, 6, 9 } },
+  { "6", { 0, 4, 7, 9 } }, { "m6", { 0, 3, 7, 9 } }, { "add9", { 0, 2, 4, 7 } },
+  { "9", { 0, 2, 4, 7, 10 } }, { "M9", { 0, 2, 4, 7, 11 } }, { "m9", { 0, 2, 3, 7, 10 } },
+  { "7sus4", { 0, 5, 7, 10 } },
+}
+
+function T.detect(notes)
+  if not notes or #notes < 2 then return nil end
+  local sorted_n = {}
+  for i, n in ipairs(notes) do sorted_n[i] = n end
+  table.sort(sorted_n)
+  local pcs, count = {}, 0
+  for _, n in ipairs(sorted_n) do
+    if not pcs[n % 12] then pcs[n % 12] = true count = count + 1 end
+  end
+  local bass = sorted_n[1] % 12
+  -- the bass as the root first, so C E G is C and not a slash chord
+  local roots = { bass }
+  for _, n in ipairs(sorted_n) do
+    if n % 12 ~= bass then roots[#roots + 1] = n % 12 end
+  end
+  for _, r in ipairs(roots) do
+    for _, sh in ipairs(SHAPES) do
+      if #sh[2] == count then
+        local hit = true
+        for _, iv in ipairs(sh[2]) do
+          if not pcs[(r + iv) % 12] then hit = false break end
+        end
+        if hit then
+          local name = K.NOTE_NAMES[r + 1] .. sh[1]
+          if r ~= bass then name = name .. "/" .. K.NOTE_NAMES[bass + 1] end
+          return name
+        end
+      end
+    end
+  end
+  return nil
+end
+
+-- the order an arpeggio plays a chord's notes in (1 UP is the default)
+function T.arp_order(notes, mode)
+  local up = {}
+  for i, n in ipairs(notes) do up[i] = n end
+  table.sort(up)
+  local m = K.ARPS[mode] or "UP"
+  if m == "DOWN" then
+    local d = {}
+    for i = #up, 1, -1 do d[#d + 1] = up[i] end
+    return d
+  elseif m == "UPDN" then
+    local o = {}
+    for _, n in ipairs(up) do o[#o + 1] = n end
+    for i = #up - 1, 2, -1 do o[#o + 1] = up[i] end
+    return o
+  end
+  return up
 end
 
 -- the name of a set of notes, for the screen: one note, or its chord
