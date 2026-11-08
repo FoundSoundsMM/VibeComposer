@@ -102,9 +102,14 @@ function T.remap(note, root, from, to)
     local d, rem = T.note_degree(note, root, from)
     return T.degree_note(root, to, d) + rem
   end
+  return T.quantize(note, root, to)
+end
+
+-- the nearest note of the scale (ties go down)
+function T.quantize(note, root, si)
   for off = 0, 6 do
-    if T.in_scale(note - off, root, to) then return note - off end
-    if T.in_scale(note + off, root, to) then return note + off end
+    if T.in_scale(note - off, root, si) then return note - off end
+    if T.in_scale(note + off, root, si) then return note + off end
   end
   return note
 end

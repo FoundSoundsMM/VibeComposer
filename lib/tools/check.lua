@@ -248,7 +248,7 @@ ok(T.follow(66, { kind = 2, notes = { 57, 60, 64 } }, St.d) == 64, "F# snaps to 
 -- -------------------------------------------------------------------- grid
 
 -- every page draws without overlapping text
-for _, pg in ipairs({ "home", "track", "tc1", "tc2", "tc3", "tc4", "gen", "mut", "keys", "chord", "settings", "tset" }) do
+for _, pg in ipairs({ "home", "track", "tc1", "tc2", "tc3", "tc4", "gen", "rain", "keys", "chord", "settings", "tset" }) do
   P.open(pg)
   for lane = 1, 3 do
     P.lane[pg] = lane
@@ -683,16 +683,193 @@ frame("track 512")
 P.open("home") frame("home 512")
 c1.len = 16
 
--- --------------------------------------------------- generate and mutate
+-- speed: x1, then left divides by 2 down to /64
+P.open("track") P.lane.track = 2
+c1 = St.clip(1)
+c1.speed = 1
+local seen_s = {}
+for _ = 1, 8 do
+  P.enc(3, -1)
+  seen_s[#seen_s + 1] = P.DEFS.track.lanes[2][2].get()
+end
+ok(table.concat(seen_s, " ") == "/2 /4 /8 /16 /32 /64 /64 /64", "speed left: " .. table.concat(seen_s, " "))
+P.enc(3, 1)
+ok(c1.speed == 32, "right is faster again")
+for _ = 1, 9 do P.enc(3, 1) end
+ok(c1.speed == 1 and P.DEFS.track.lanes[2][2].get() == "x1", "x1 is as fast as it goes")
+c1.speed = 3                                 -- an older project's speed
+P.enc(3, -1)
+ok(c1.speed == 4, "an old in-between speed goes to the next one along")
+c1.speed = 1
+-- /64: a step every 16 beats, still on the beat
+c1.steps, c1.len = { St.new_step(1, { 60 }) }, 1
+c1.speed = 64
+log = {}
+tap(1, 8) pump_beats(33) Q.stop()
+local s64 = ons(1, 1)
+ok(#s64 == 3 and math.abs((s64[2].beat - s64[1].beat) - 16) < 0.01, "/64 plays every 16 beats")
+c1.speed = 1
+
+-- ------------------------------------------------------ generate, rain
 
 tap(1, 7)
 tap(7, 6) tap(7, 6)
 local n = 0
 for _ in pairs(St.clip(1).steps) do n = n + 1 end
 ok(n > 0, "GENERATE wrote steps")
-tap(8, 6) tap(8, 6)
-P.open("mut") P.lane.mut = 2 P.enc(2, 1) P.enc(3, 1)
-for _, pg in ipairs({ "home", "gen", "mut" }) do P.open(pg) frame(pg .. " after generate") end
+P.lane.gen = 3 P.enc(2, 1) P.enc(3, 1)
+ok(P.rot == 1 and P.shf == 1, "ROTATE and SHIFT on the GEN page")
+
+-- rain: an empty track at 100 % catches drops, every one in the scale
+Q.stop()
+St.d.scale = 13                              -- minor pentatonic, to make it count
+c1 = St.clip(1)
+c1.steps, c1.len = {}, 16
+tap(8, 6)
+ok(P.page == "rain", "RAIN opens its page")
+P.lane.rain = 1 P.enc(2, 100)
+ok(St.track(1).rain == 100, "rain 100%")
+frame("rain page")
+-- track 8 transposes a semitone: the drops must still land in the scale
+local c8b = St.clip(8)
+c8b.steps, c8b.len = { St.new_step(8, { St.d.root + 1 }) }, 1
+math.randomseed(7)
+log = {}
+tap(1, 8) pump_beats(16) Q.stop()
+local drops = ons(1, 1)
+ok(#drops > 5, "rain fell: " .. #drops .. " drops")
+local outside = 0
+for _, e in ipairs(drops) do
+  if not T.in_scale(e.a, St.d.root, St.d.scale) then outside = outside + 1 end
+end
+ok(outside == 0, outside .. " drops outside the scale")
+-- it does not fall on a note that is still sounding
+c1.steps[1] = St.new_step(1, { 60 })
+c1.steps[1].len = 16
+log = {}
+tap(1, 8) pump_beats(7.9) Q.stop()
+ok(#ons(1, 1) == 2, "no rain under a held note: " .. #ons(1, 1))
+-- RAIN again on its page: off, the amount kept
+tap(8, 6)
+ok(St.track(1).rain_off and St.track(1).rain == 100, "RAIN again: off, amount kept")
+c1.steps = {}
+log = {}
+tap(1, 8) pump_beats(4) Q.stop()
+ok(#ons(1, 1) == 0, "no rain while off")
+tap(8, 6)
+St.track(1).rain = 0
+c8b.steps = {}
+St.d.scale = 1
+for _, pg in ipairs({ "home", "gen", "rain" }) do P.open(pg) frame(pg .. " after generate") end
+
+-- TC1 with nothing held and COND at --: PROB is the whole track's
+tap(1, 6)
+P.lane.tc1 = 1
+P.enc(3, -100)
+ok(St.track(1).prob == 0 and St.track(1).tpl.prob == nil, "PROB set the track's probability")
+frame("tc1 track prob")
+c1.steps, c1.len = {}, 4
+for i = 1, 4 do c1.steps[i] = St.new_step(1, { 60 }) end
+log = {}
+tap(1, 8) pump_beats(2) Q.stop()
+ok(#ons(1, 1) == 0, "track at 0 %: silent")
+P.enc(3, 50)
+log = {}
+tap(1, 8) pump_beats(16) Q.stop()
+local hits = #ons(1, 1)
+ok(hits > 16 and hits < 48, "track at 50 %: about half of 64, got " .. hits)
+-- a COND on new steps: PROB goes back to being the new steps'
+P.enc(2, 1)
+P.enc(3, -10)
+ok(St.track(1).prob == 50 and St.track(1).tpl.prob == 90, "COND set: PROB is the new steps' again")
+St.track(1).prob = 100
+St.track(1).tpl = {}
+
+-- ------------------------------------------- a snapshot is every setting
+
+local function deep_eq(a, b, path)
+  if type(a) ~= type(b) then return false, path end
+  if type(a) ~= "table" then return a == b, path end
+  for k, v in pairs(a) do
+    local e, w = deep_eq(v, b[k], path .. "." .. tostring(k))
+    if not e then return false, w end
+  end
+  for k in pairs(b) do
+    if a[k] == nil then return false, path .. "." .. tostring(k) end
+  end
+  return true
+end
+
+Q.stop()
+-- set something everywhere
+St.d.scale, St.d.root, St.d.swing, St.d.sig, St.d.transpose = 4, 50, 58, 8, 2
+St.d.layout, St.d.inkey, St.d.vel, St.d.cvel, St.d.strum, St.d.vlead = 3, true, 90, 80, 40, true
+St.d.arp, St.d.arp_rate, St.d.koct = 3, 5, -1
+St.d.mods = { ext = "9", inv = "DROP2" }
+St.d.gen = { style = 4, density = 70, range = 3, pool = 3 }
+for t = 1, K.NTRACKS do
+  local tr = St.track(t)
+  tr.swing, tr.dev, tr.ch, tr.follow, tr.mute, tr.oct = t - 4, (t % 3) + 1, 17 - t, t % 2 == 0, t == 3, (t % 3) - 1
+  tr.prog, tr.rain, tr.rain_off, tr.rain_spread, tr.rain_centre, tr.prob = t * 5, t * 10, t == 2, t + 2, 60 + t, 100 - t
+  tr.clip = (t % 4) + 1
+  tr.tpl = { vel = 50 + t, cond = 2 }
+  for c = 1, K.NCLIPS do
+    local cl = tr.clips[c]
+    cl.len, cl.speed, cl.dir = 8 + t + c, ({ 1, 2, 4, 8 })[c], ((t + c) % 5) + 1
+    cl.steps = { [1] = St.new_step(t, { 60 + c, 64 + t }), [3] = St.new_step(t, { 48 }) }
+    cl.steps[1].len, cl.steps[1].ratchet = 3, 2
+  end
+end
+tap(10, 2)                                   -- chord keyboard
+tap(6, 7)                                    -- track 6
+Q.live_master({ notes = { 52 } })            -- track 8 given E live
+Kb.last = { notes = { 55, 59, 62 }, vel = 80 }
+
+if not G.settings then tap(8, 8) end
+press(16, 8) now = now + 0.7 N.tick(0.7) release(16, 8)
+ok(N.has(48), "snapshot 48 saved")
+local saved = St.copy(St.d)
+local saved_tempo = params:get("clock_tempo")
+
+-- change it all
+St.d = St.fill({ tracks = {} })
+for t = 1, K.NTRACKS do St.d.tracks[t] = St.new_track(t) end
+params:set("clock_tempo", 97)
+tap(10, 2) Kb.set_mode(1)
+G.select(2)
+Q.hist = {}
+Kb.last = { notes = { 30 } }
+
+log = {}
+tap(16, 8)                                   -- load (stopped: at once)
+local same, where = deep_eq(saved, St.d, "d")
+ok(same, "every setting came back" .. (where and (", first difference at " .. where) or ""))
+ok(params:get("clock_tempo") == saved_tempo, "tempo came back")
+ok(Kb.mode == 2, "chord keyboard came back")
+ok(G.sel == 6, "selected track came back")
+ok(Kb.last.notes[1] == 55, "last played notes came back")
+local m = Q.master_now()
+ok(m and m.notes[1] == 52, "track 8's live transposition came back")
+local pcs = 0
+for _, e in ipairs(log) do if e.kind == "pc" then pcs = pcs + 1 end end
+ok(pcs == K.NTRACKS, "program changes sent on load: " .. pcs)
+frame("after full snapshot")
+
+-- an empty pad: a new snapshot at the defaults
+ok(not N.has(47), "pad 47 empty")
+tap(15, 8)
+ok(N.has(47), "tapping an empty pad made a snapshot there")
+local fresh = St.new()
+local d2 = St.copy(St.d) d2.ui = nil
+local same2, where2 = deep_eq(St.fill(fresh), d2, "d")
+ok(same2, "the new snapshot is all defaults" .. (where2 and (", first difference at " .. where2) or ""))
+ok(params:get("clock_tempo") == 120, "default tempo")
+ok(Kb.mode == 1 and G.sel == 1, "keys up, track 1 selected")
+ok(Q.master_now() == nil, "no track 8 transposition")
+ok(N.last == 47, "pad 47 is the current snapshot")
+tap(16, 8)                                   -- the saved one still loads
+ok(Kb.mode == 2 and G.sel == 6, "pad 48 still loads over it")
+tap(8, 8)
 
 cleanup()
 ok(params:get("clock_midi_out_1") == 1, "norns clock out given back on exit")

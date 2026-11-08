@@ -23,7 +23,7 @@ Then pick VIBECOMPOSER from the norns SELECT menu.
   C  [ steps 17-24                        ]  .    .    [    or     ]
   D  [ steps 25-32   (K2 / K3: pages)     ]  .    .    [  chords   ]
   E    .    .    .    .    .    .    .    .    .    .    [           ]
-  F    TC1  TC2  .    TC3  TC4  .    GEN  MUT  .    .    [           ]
+  F    TC1  TC2  .    TC3  TC4  .    GEN  RAIN .    .    [           ]
   G    T1   T2   T3   T4   T5   T6   T7   T8   .    OCT+ [           ]
   H    PLAY STOP REC  .    .    .    .    SET  .    OCT- [ root      ]
 ```
@@ -61,8 +61,10 @@ skipped.
 - **M** switches to the keyboard and opens KEYS. **C** switches to chords
   and opens CHORD.
 - **TC1-TC4** open the trig-condition pages.
-- **GEN** opens GENERATE. Press it again to generate a pattern. **MUT**
-  works the same way for MUTATE.
+- **GEN** opens GENERATE. Press it again to generate a pattern.
+- **RAIN** opens RAIN. Press it again to stop or start the rain on the
+  selected track, keeping its amount. The button glows when the track has
+  rain on.
 - **PLAY** plays, and pressing it again pauses. A paused song carries on from
   where it stopped. Hold PLAY while the song is playing for **FILL**.
 - **STOP** stops and goes back to the start. It also clears track 8's
@@ -84,13 +86,13 @@ last page you had open.
 
 | page | lane 1 | lane 2 | lane 3 |
 |---|---|---|---|
-| TRACK | DIRECTION (fwd, bwd, pendulum, walk, random), SWING (offset on the global swing) | LENGTH 1-512, SPEED (1/16 to 1/1) | |
+| TRACK | DIRECTION (fwd, bwd, pendulum, walk, random), SWING (offset on the global swing) | LENGTH 1-512, SPEED (x1 is a step every 16th; turn left for /2, /4, /8, /16, /32, /64) | |
 | TC1 | COND, PROB | VEL, GATE | |
 | TC2 | MICRO, OCT | RATCHET, R.FADE | |
 | TC3 | PULSES 1-8, MODE (repeat / hold / single / rest) | SKIP, RAMP | |
 | TC4 | ACCUM, LIMIT | SLIDE, NOTE | |
-| GEN | STYLE, DENSITY | RANGE, POOL (scale / last played / chords) | |
-| MUT | AMOUNT, TARGET | ROTATE, SHIFT (these act as you turn) | |
+| GEN | STYLE, DENSITY | RANGE, POOL (scale / last played / chords) | ROTATE, SHIFT (these act as you turn) |
+| RAIN | AMOUNT, SPREAD (scale steps either side) | CENTRE (AUTO or a note) | |
 | KEYS | LAYOUT (4ths, 3rds, 5ths, seq), ROOT | IN-KEY, VELOCITY | |
 | CHORD | ROOT, VELOCITY | STRUM (ms), V.LEAD | ARP (off, up, down, up-down, random), RATE (1/32 to 1/4, with triplets) |
 | SETTINGS | SCALE, TEMPO | SWING, SIGNATURE | TRANSPOSE (chromatic / in key) |
@@ -123,6 +125,11 @@ global swing.
 - **COND**: `--`, FILL, !FILL, PRE, !PRE, NEI, !NEI, 1ST, !1ST, or A:B from
   1:2 to 8:8. PRE checks this track's last condition. NEI checks the track
   to the left, and track 1's neighbour is track 8.
+- **PROB** is the step's chance of playing. With no step held and the
+  new-step COND at `--`, PROB is the whole track's chance instead (shown as
+  "ALL"). Every step on the track then plays only that often, on top of its
+  own PROB. Set a COND for new steps and PROB goes back to setting new
+  steps' chance.
 - **MICRO** moves the step up to half a step early or late.
 - **RATCHET** splits each hit into 1-8 evenly spaced notes. **R.FADE**
   fades them out (positive) or in (negative).
@@ -142,6 +149,25 @@ global swing.
   synth glide.
 - **NOTE** moves the held steps' notes by a semitone, or by a scale step
   when IN-KEY is on.
+
+## Rain
+
+Rain works the way it does in drumdrum. Each track has its own amount.
+Whenever one of its steps would play nothing, a note may fall into it
+instead. That covers an empty step, a step whose condition failed, and a
+REST pulse.
+
+- **Amount:** the chance of a drop and how loud it is both grow with the
+  square of AMOUNT. A little rain is a stray note every few bars; a lot is a
+  downpour.
+- **Always in the scale:** every drop is a note of the key's scale, within
+  SPREAD scale steps of CENTRE. CENTRE is either a note you pick or AUTO,
+  the middle of the clip's own notes. Drops stay in the scale even when
+  track 8 has transposed the track somewhere else.
+- **Never over a held note:** rain doesn't fall while the track is still
+  sounding a note, so long notes and ties are left alone.
+
+Drops aren't written into the clip: each pass rains differently.
 
 ## Scale
 
@@ -226,11 +252,25 @@ FOLLOW (in TRACK SETTINGS) turns following off for a track.
   - An empty slot launches as a new empty clip one bar long.
   - Hold a clip and tap another to copy it. This works between tracks too.
   - Hold STOP and tap a clip to empty it.
-- **Snapshots** are the keyboard's 48 pads. A snapshot holds the whole
-  project: every clip, every setting, the key, swing, signature and tempo.
+- **Snapshots** are the keyboard's 48 pads. A snapshot holds every
+  setting:
+  - every track's clips and steps, and its settings: swing, direction,
+    probability, rain, device, channel, follow, mute, octave and program
+  - the key, scale, transpose mode, swing, signature and tempo. The tempo
+    only loads on the internal clock.
+  - the keyboard and chord settings, latched modifiers, arp and octave
+  - which keyboard is up (keys or chords), the selected track, the notes
+    you played last, and track 8's live transposition
+
+  Loading a snapshot resends every track's program change. The MIDI
+  clock-out ports aren't in snapshots, because they belong to the norns,
+  not the song. Neither is norns' clock source.
   - Hold a pad until it fills to save.
   - Tap a pad to load it. While playing, it loads on the next bar and every
     track restarts from step 1.
+  - Tap an empty pad for a new snapshot with every setting at its default
+    (empty clips, C major, 120 BPM, channels 1-8). It loads like any other,
+    so it's a blank song to start from.
   - Hold STOP and hold a pad to delete it.
 
 In the session view, STOP acts when you let go of it. This lets you hold it
@@ -270,7 +310,7 @@ it. Snapshots are saved as you make them. Both live in
 clock and MIDI ports. It checks:
 
 - note timing and sync messages
-- transposition, the scale following, directions, note lengths and
-  arpeggios
+- transposition, the scale following, directions, note lengths,
+  arpeggios and rain
 - recording, conditions, clips and snapshots
 - that no text on any screen overlaps

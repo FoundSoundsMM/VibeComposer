@@ -8,7 +8,7 @@
 --   C  [ steps 17-24                         ]  .    .    [     or     ]
 --   D  [ steps 25-32 (K2 / K3: other pages)  ]  .    .    [   chords   ]
 --   E    .    .    .    .    .    .    .    .    .    .    [            ]
---   F    TC1  TC2  .    TC3  TC4  .    GEN  MUT  .    .    [            ]
+--   F    TC1  TC2  .    TC3  TC4  .    GEN  RAIN .    .    [            ]
 --   G    T1   T2   T3   T4   T5   T6   T7   T8   .    OCT+ [            ]
 --   H    PLAY STOP REC  .    .    .    .    SET  .    OCT- [ root ...   ]
 --
@@ -251,11 +251,13 @@ local function key_main(x, y, z)
       Gn.generate(G.sel)
       G.flash.GEN = now()
     else P.open("gen") end
-  elseif is("MUT", x, y) then
-    if P.page == "mut" then
-      Gn.mutate(G.sel)
-      G.flash.MUT = now()
-    else P.open("mut") end
+  elseif is("RAIN", x, y) then
+    -- on its page, RAIN again stops and starts the rain (the amount stays)
+    if P.page == "rain" then
+      local tr = St.track(G.sel)
+      tr.rain_off = not tr.rain_off
+      P.show({ tr.rain_off and "RAIN OFF" or "RAIN ON", "track " .. G.sel .. ", " .. (tr.rain or 0) .. "%", "" })
+    else P.open("rain") end
   elseif is("M", x, y) then
     Kb.set_mode(1)
     page_btn("keys")
@@ -484,7 +486,10 @@ local function draw_buttons()
   page("TC3", "tc3")
   page("TC4", "tc4")
   page("GEN", "gen")
-  page("MUT", "mut")
+  -- RAIN glows with the selected track's rain
+  local tr = St.track(G.sel)
+  local wet = ((tr.rain or 0) > 0) and not tr.rain_off
+  b("RAIN", (P.page == "rain") and 15 or (wet and (5 + math.floor(tr.rain / 20)) or 2))
   b("M", (Kb.mode == 1) and ((P.page == "keys") and 15 or 9) or 3)
   b("C", (Kb.mode == 2) and ((P.page == "chord") and 15 or 9) or 3)
   local o = St.d.koct or 0

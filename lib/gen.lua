@@ -1,17 +1,15 @@
 -- vibecomposer / gen
 --
--- Pattern generation (G, row F column 7) and mutation (G, column 8).
--- Both work on the selected track's playing clip and keep its length.
+-- Pattern generation (G, row F column 7). It works on the selected track's
+-- playing clip and keeps its length.
 --
 -- GENERATE writes a new pattern. STYLE is where the hits go and how the
 -- notes move; DENSITY how many steps play; RANGE how many octaves up from
 -- the root the notes can reach; POOL whether they come from the scale,
 -- from the notes played last on the keyboard, or are the key's chords.
 --
--- MUTATE changes what is there: AMOUNT of the steps move a note a scale
--- step or two (NOTES), slide to a neighbouring empty step (RHYTHM), or
--- either (BOTH). ROTATE and SHIFT act as you turn them: the pattern turns
--- round a step, or every note moves a scale step.
+-- ROTATE and SHIFT act as you turn them: the pattern turns round a step,
+-- or every note moves a scale step.
 
 local K = include("lib/const")
 local T = include("lib/theory")
@@ -96,31 +94,6 @@ local function shift_notes(st, n)
   end
 end
 Gn.shift_notes = shift_notes
-
-function Gn.mutate(t)
-  local m = St.d.mut
-  local c = St.clip(t)
-  local p = m.amount / 100
-  local moved = {}
-  for i = 1, c.len do
-    local st = c.steps[i]
-    if St.has_notes(st) and not moved[i] and math.random() < p then
-      local what = m.target
-      if what == 3 then what = math.random(2) end
-      if what == 1 then
-        local d = math.random(1, 2) * ((math.random() < 0.5) and -1 or 1)
-        shift_notes(st, d)
-      else
-        local j = i + ((math.random() < 0.5) and -1 or 1)
-        if j < 1 then j = c.len elseif j > c.len then j = 1 end
-        if not St.has_notes(c.steps[j]) then
-          c.steps[j], c.steps[i] = st, nil
-          moved[j] = true
-        end
-      end
-    end
-  end
-end
 
 -- turn the pattern round by d steps within its length
 function Gn.rotate(t, d)

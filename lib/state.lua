@@ -37,6 +37,11 @@ function St.new_track(i)
     mute = false,
     oct = 0,
     prog = -1,          -- program change sent when set; -1 is off
+    rain = 0,           -- RAIN amount, 0-100
+    rain_off = false,   -- RAIN paused (tap RAIN again on its page)
+    rain_spread = 7,    -- scale steps either side of the centre
+    rain_centre = -1,   -- the note rain falls around; -1: the clip's own
+    prob = 100,         -- the whole track's probability (TC1, nothing held)
     clip = 1,
     clips = clips,
     tpl = {},           -- what a new step starts with (TC pages, nothing held)
@@ -64,7 +69,6 @@ function St.new()
     transpose = 1,      -- 1 chromatic, 2 in key
     mods = {},
     gen = { style = 1, density = 50, range = 2, pool = 1 },
-    mut = { amount = 25, target = 3 },
   }
   for i = 1, K.NTRACKS do d.tracks[i] = St.new_track(i) end
   return d

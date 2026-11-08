@@ -8,7 +8,8 @@
 --   TC1, TC2  trig conditions, Elektron-style
 --   TC3, TC4  Metropolix stages: pulses, gate modes, skip, ramp,
 --             accumulator, slide
---   GEN, MUT  pattern generation and mutation
+--   GEN       pattern generation, ROTATE and SHIFT
+--   RAIN      in-scale notes falling into a track's silent steps
 --   KEYS      LAYOUT | ROOT, IN-KEY | VELOCITY
 --   CHORD     ROOT | VELOCITY, STRUM | V.LEAD, ARP | RATE
 --   SETTINGS  SCALE | TEMPO, SWING | SIGNATURE, TRANSPOSE
@@ -45,15 +46,25 @@ local function sel() return G.sel end
 local function tr() return St.track(G.sel) end
 local function clip() return St.clip(G.sel) end
 
-local function gcd(a, b)
-  while b ~= 0 do a, b = b, a % b end
-  return a
+-- SPEED: x1 is a step every sixteenth; turning left divides it down.
+-- clip.speed is how many sixteenths a step lasts.
+local SPEEDS = { 1, 2, 4, 8, 16, 32, 64 }
+
+local function speed_name(n)
+  if n <= 1 then return "x1" end
+  return "/" .. n
 end
 
--- a step of n sixteenths, as a note length
-local function speed_name(n)
-  local g = gcd(n, 16)
-  return (n / g) .. "/" .. (16 / g)
+-- one detent: right is faster, left slower (a speed between the steps, from
+-- an older project, goes to the next one along)
+local function speed_step(n, d)
+  local i = 1
+  for k, v in ipairs(SPEEDS) do
+    if v <= n then i = k end
+  end
+  if d < 0 then return SPEEDS[math.min(i + 1, #SPEEDS)] end
+  if SPEEDS[i] < n then return SPEEDS[i] end
+  return SPEEDS[math.max(i - 1, 1)]
 end
 
 -- ------------------------------------------------------------------ steps
@@ -139,22 +150,44 @@ DEFS.track = {
       { name = "LENGTH", get = function() return tostring(clip().len) end,
         delta = function(d) clip().len = clamp(clip().len + d, 1, K.MAXLEN) end },
       { name = "SPEED", get = function() return speed_name(clip().speed) end,
-        delta = function(d) clip().speed = clamp(clip().speed + sgn(d), 1, 16) end },
+        delta = function(d) clip().speed = speed_step(clip().speed, sgn(d)) end },
     },
   },
 }
 
 local function tc_info()
   local held = G.held_steps()
-  if #held == 0 then return "NEW STEPS" end
+  if #held == 0 then
+    if P.page == "tc1" and St.get(tr().tpl, "cond") == 1 then return "NEW STEPS +ALL" end
+    return "NEW STEPS"
+  end
   return "STEP " .. held[1] .. ((#held > 1) and ("+" .. (#held - 1)) or "")
 end
+
+-- PROB. With nothing held and the new-step COND at --, it is the whole
+-- track's probability: every step plays only that often, on top of its own.
+local function whole_track()
+  return #G.held_steps() == 0 and St.get(tr().tpl, "cond") == 1
+end
+
+local STEP_PROB = sp("PROB", "prob", 0, 100, pct)
+local TRACK_PROB = {
+  name = "PROB",
+  get = function()
+    if whole_track() then return (tr().prob or 100) .. "% ALL" end
+    return STEP_PROB.get()
+  end,
+  delta = function(d)
+    if whole_track() then tr().prob = clamp((tr().prob or 100) + d, 0, 100)
+    else STEP_PROB.delta(d) end
+  end,
+}
 
 DEFS.tc1 = {
   title = function() return "TC1 T" .. sel() end, info = tc_info,
   lanes = {
     { sp("COND", "cond", 1, #K.CONDS, function(v) return K.CONDS[v] end),
-      sp("PROB", "prob", 0, 100, pct) },
+      TRACK_PROB },
     { sp("VEL", "vel", 1, 127, plain),
       { name = "GATE",
         get = function()
@@ -218,19 +251,6 @@ DEFS.gen = {
       { name = "POOL", get = function() return K.GEN_POOLS[St.d.gen.pool] end,
         delta = function(d) St.d.gen.pool = clamp(St.d.gen.pool + sgn(d), 1, #K.GEN_POOLS) end },
     },
-  },
-}
-
-DEFS.mut = {
-  title = function() return "MUTATE T" .. sel() end,
-  info = function() return "G AGAIN: GO" end,
-  lanes = {
-    {
-      { name = "AMOUNT", get = function() return St.d.mut.amount .. "%" end,
-        delta = function(d) St.d.mut.amount = clamp(St.d.mut.amount + d, 5, 100) end },
-      { name = "TARGET", get = function() return K.MUT_TARGETS[St.d.mut.target] end,
-        delta = function(d) St.d.mut.target = clamp(St.d.mut.target + sgn(d), 1, #K.MUT_TARGETS) end },
-    },
     {
       { name = "ROTATE", get = function() return signed(P.rot) end,
         delta = function(d)
@@ -244,6 +264,43 @@ DEFS.mut = {
           Gn.shift(sel(), d)
           P.shf = P.shf + d
         end },
+    },
+  },
+}
+
+DEFS.rain = {
+  title = function() return "RAIN T" .. sel() end,
+  info = function()
+    if (tr().rain or 0) == 0 then return "DRY" end
+    return tr().rain_off and "RAIN AGAIN: ON" or "RAIN AGAIN: OFF"
+  end,
+  lanes = {
+    {
+      { name = "AMOUNT",
+        get = function()
+          local s = (tr().rain or 0) .. "%"
+          if tr().rain_off then s = s .. " OFF" end
+          return s
+        end,
+        delta = function(d) tr().rain = clamp((tr().rain or 0) + d, 0, 100) end },
+      { name = "SPREAD", get = function() return "+-" .. (tr().rain_spread or 7) end,
+        delta = function(d) tr().rain_spread = clamp((tr().rain_spread or 7) + sgn(d), 1, 21) end },
+    },
+    {
+      { name = "CENTRE",
+        get = function()
+          if (tr().rain_centre or -1) < 0 then return "AUTO " .. K.note_name(Q.rain_centre(sel())) end
+          return K.note_name(tr().rain_centre)
+        end,
+        delta = function(d)
+          local v = tr().rain_centre or -1
+          if v < 0 then v = (d > 0) and Q.rain_centre(sel()) or -1
+          else v = v + d end
+          -- turned down past the lowest note: back to AUTO
+          if v < 12 then v = -1 end
+          tr().rain_centre = math.min(v, 108)
+        end },
+      nil,
     },
   },
 }
@@ -396,7 +453,7 @@ P.DEFS = DEFS
 -- -------------------------------------------------------------- navigation
 
 function P.open(page)
-  if page ~= "mut" then P.rot, P.shf = 0, 0 end
+  if page ~= "gen" then P.rot, P.shf = 0, 0 end
   P.page = page
   if page ~= "home" and page ~= "settings" then P.last = page end
   Q.dirty = true

@@ -27,7 +27,7 @@ K.BTN = {
   TC3  = { 4, 6 },
   TC4  = { 5, 6 },
   GEN  = { 7, 6 },
-  MUT  = { 8, 6 },
+  RAIN = { 8, 6 },
   PLAY = { 1, 8 },
   STOP = { 2, 8 },
   REC  = { 3, 8 },
@@ -181,7 +181,6 @@ K.ARP_RATES = {
 
 K.GEN_STYLES = { "EUCLID", "RANDOM", "ARP UP", "ARP RND", "WALK", "BASS" }
 K.GEN_POOLS = { "SCALE", "LAST", "CHORDS" }
-K.MUT_TARGETS = { "NOTES", "RHYTHM", "BOTH" }
 
 -- --------------------------------------------------------- step defaults
 

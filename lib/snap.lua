@@ -9,10 +9,17 @@
 -- Hold a clip and tap another to copy it there (any track to any track).
 -- Hold STOP and tap a clip to empty it.
 --
--- SNAPSHOTS, the keyboard's 48 pads. A snapshot is the whole project: every
--- track's clips, settings and MIDI, the key, swing, signature and tempo
--- (the tempo only lands on the internal clock). Tap to load: on the next
--- bar while playing, every track from step 1 there. Hold to save: the pad
+-- SNAPSHOTS, the keyboard's 48 pads. A snapshot is every setting there is:
+-- every track's clips, steps, settings, MIDI device, channel, program and
+-- rain; the key, scale, swing, signature, transpose mode and tempo (the
+-- tempo only lands on the internal clock); the keyboard and chord settings,
+-- latched modifiers, arp and octave; which keyboard is up (keys or chords),
+-- the selected track, the notes played last and track 8's live
+-- transposition. Not in it: the MIDI clock-out ports (they belong to the
+-- machine) and norns' own clock source. Tap to load: on the next
+-- bar while playing, every track from step 1 there. Tap an empty pad and it
+-- becomes a new snapshot with every setting at its default, loaded the same
+-- way: a blank song to start from. Hold to save: the pad
 -- fills as you hold, and a save only happens once it is full. Hold STOP and
 -- hold a pad to delete it the same way.
 
@@ -36,6 +43,7 @@ end
 -- -------------------------------------------------------------- snapshots
 
 local function capture()
+  if N.before_capture then N.before_capture() end
   local s = St.copy(St.d)
   s.tempo = params:get("clock_tempo")
   return s
@@ -93,6 +101,15 @@ function N.recall(i)
   end)
 end
 
+-- an empty pad tapped: a new snapshot there, every setting at its default
+function N.fresh(i)
+  local s = St.new()
+  s.ui = { mode = 1, sel = 1, last = { notes = { s.root } } }
+  N.slots[i] = s
+  N.save_file()
+  N.recall(i)
+end
+
 function N.hold_start(i, kind)
   if kind == "delete" and not N.slots[i] then return end
   N.act = { slot = i, t0 = util.time(), kind = kind }
@@ -129,7 +146,7 @@ function N.hold_end(i)
   if (util.time() - a.t0) >= N.HOLD then
     commit(a)
   elseif a.kind == "save" then
-    N.recall(i)
+    if N.slots[i] then N.recall(i) else N.fresh(i) end
   end
 end
 

@@ -75,6 +75,38 @@ local function add_params()
   end)
 end
 
+-- ------------------------------------------------------------- ui state
+--
+-- What a snapshot and the saved project carry besides St.d's own settings:
+-- which keyboard is up, the selected track, the notes a step press takes,
+-- and the transposition track 8 was last given live.
+
+local function ui_out()
+  St.d.ui = {
+    mode = Kb.mode,
+    sel = G.sel,
+    last = St.copy(Kb.last),
+    last_chord = St.copy(Kb.last_chord),
+    chord_name = Kb.chord_name,
+    master = St.copy(Q.master_now()),
+  }
+end
+
+local function ui_in()
+  local u = St.d.ui
+  if type(u) ~= "table" then return end
+  if u.mode then Kb.set_mode(u.mode) end
+  if u.sel then
+    G.select(u.sel)
+    P.tset_track = nil
+  end
+  if u.last and u.last.notes then Kb.last = St.copy(u.last) end
+  Kb.last_chord = St.copy(u.last_chord)
+  Kb.chord_name = u.chord_name
+  -- no transposition saved: none from here on
+  Q.live_master(u.master and St.copy(u.master) or nil)
+end
+
 -- ---------------------------------------------------------------- init
 
 function init()
@@ -87,8 +119,17 @@ function init()
   N.load_file()
   P.init(St, Q, Kb, G, Gn, O)
   G.init(St, Q, Kb, N, Gn, P)
-  N.on_load = function() Kb.release_all() end
+  N.before_capture = ui_out
+  N.on_load = function()
+    Kb.release_all()
+    ui_in()
+    for t = 1, K.NTRACKS do
+      local tr = St.track(t)
+      O.program(tr.dev, tr.ch, tr.prog)
+    end
+  end
   Kb.show = P.show
+  ui_in()
   Q.on_tick = Kb.arp_tick
 
   add_params()
@@ -135,6 +176,7 @@ function cleanup()
     if m then m:stop() end
   end
   St.d.tempo = params:get("clock_tempo")
+  ui_out()
   St.save()
   N.save_file()
   O.restore_norns_clock()

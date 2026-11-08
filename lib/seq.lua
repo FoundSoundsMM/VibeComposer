@@ -104,6 +104,7 @@ function Q.reset_track(t, line)
   rt.pos, rt.pulse, rt.npulses, rt.loop = 0, 1, 1, 0
   rt.pass, rt.pre, rt.k = false, false, 0
   rt.pdir, rt.count = 1, 0
+  rt.busy = 0
   rt.accs, rt.acc_off = {}, 0
   rt.next_line = line or 0
   rt.ph = 0
@@ -216,6 +217,9 @@ function Q.cond(t, rt, st)
   end
   local prob = St.get(st, "prob")
   if res and prob < 100 then res = math.random(100) <= prob end
+  -- the track's own probability, on top of the step's
+  local tp = St.track(t).prob or 100
+  if res and tp < 100 then res = math.random(100) <= tp end
   if c ~= "PRE" and c ~= "!PRE" and c ~= "NEI" and c ~= "!NEI" then rt.pre = res end
   return res
 end
@@ -226,6 +230,11 @@ local PRI = { [0] = 0, [2] = 1, [1] = 2 }  -- offs, then playheads, then ons
 
 local function push(e)
   e.pri = PRI[e.kind]
+  -- how long the track is sounding for, so rain does not fall on a note
+  if e.kind == 0 then
+    local rt = Q.rt[e.rec.t]
+    rt.busy = math.max(rt.busy or 0, e.at)
+  end
   local ev = Q.events
   local i = #ev
   while i >= 1 and (ev[i].at > e.at or (ev[i].at == e.at and ev[i].pri > e.pri)) do i = i - 1 end
@@ -312,6 +321,46 @@ end
 -- ----------------------------------------------------------------- prepare
 
 -- track t's pulse on song tick L. Silent: only move the track on (a locate).
+-- RAIN, after drumdrum: a pulse that would play nothing may catch a drop.
+-- The chance and the loudness both grow with the square of the amount, so a
+-- little rain is a stray note every few bars and a lot is a downpour. A drop
+-- is always a note of the key's scale, within SPREAD scale steps of the
+-- track's own notes (or of CENTRE), and it stays in the scale after track 8
+-- has moved it. Rain never falls while the track is still sounding a note.
+
+-- the note rain falls around: CENTRE, or the middle of the clip's notes
+function Q.rain_centre(t)
+  local tr = St.track(t)
+  if (tr.rain_centre or -1) >= 0 then return tr.rain_centre end
+  local c = St.clip(t)
+  local sum, n = 0, 0
+  for i = 1, c.len do
+    local st = c.steps[i]
+    if St.has_notes(st) then
+      sum = sum + St.notes(st)[1]
+      n = n + 1
+    end
+  end
+  if n == 0 then return St.d.root + 12 end
+  return math.floor((sum / n) + 0.5)
+end
+
+local function rain(t, L, at, dv)
+  local tr, rt = St.track(t), Q.rt[t]
+  local amt = (tr.rain or 0) / 100
+  if amt <= 0 or tr.rain_off or L < (rt.busy or 0) then return end
+  if math.random() >= (amt * amt * 0.3) then return end
+  local d = St.d
+  local d0 = T.note_degree(T.quantize(Q.rain_centre(t), d.root, d.scale), d.root, d.scale)
+  local spread = tr.rain_spread or 7
+  local note = T.degree_note(d.root, d.scale, d0 + math.random(-spread, spread))
+  local vel = 127 * (0.12 + (0.5 * amt * amt)) * (0.5 + (math.random() * 0.5))
+  local rec = { t = t, line = L, note = clamp(note, 0, 127), rain = true,
+    vel = clamp(math.floor(vel + 0.5), 1, 127) }
+  push({ at = at, kind = 1, rec = rec })
+  push({ at = at + math.max(0.2, dv * 0.5), kind = 0, rec = rec })
+end
+
 local function prepare(t, L, silent)
   local tr, rt, c = St.track(t), Q.rt[t], St.clip(t)
   local dv = c.speed * K.T16
@@ -335,7 +384,10 @@ local function prepare(t, L, silent)
     at = L + ((s - 0.5) * 2 * dv)
   end
   if not silent then push({ at = at, kind = 2, t = t, line = L, pos = pos }) end
-  if not St.has_notes(st) then return end
+  if not St.has_notes(st) then
+    if not silent then rain(t, L, at, dv) end
+    return
+  end
 
   local n, p = rt.npulses, rt.pulse
   if p == 1 then
@@ -349,11 +401,18 @@ local function prepare(t, L, silent)
       end
     end
   end
-  if silent or not rt.pass then return end
+  if silent then return end
+  if not rt.pass then
+    rain(t, L, at, dv)
+    return
+  end
 
   local mode = K.MODES[St.get(st, "mode")] or "REPEAT"
   local sound = (mode == "REPEAT") or (p == 1 and (mode == "HOLD" or mode == "SINGLE"))
-  if not sound then return end
+  if not sound then
+    rain(t, L, at, dv)
+    return
+  end
 
   local span = (mode == "HOLD") and (dv * n) or dv
   local frac = (n > 1) and ((p - 1) / (n - 1)) or 0
@@ -436,6 +495,8 @@ local function fire(e)
     local rec = e.rec
     local tr, rt = St.track(rec.t), Q.rt[rec.t]
     local n = Q.final(rec.t, rec.note, rec.line)
+    -- rain stays in the key, wherever track 8 has taken the track
+    if rec.rain then n = T.quantize(n, St.d.root, St.d.scale) end
     rt.flash = util.time()
     rt.sounding[n] = (rt.sounding[n] or 0) + 1
     rec.sent = n
