@@ -1,11 +1,8 @@
 # vibe composer
 
-An eight-track sequencer for norns and a grid 128, with an eight-voice drum
-machine (drumdrum, ported in) running alongside it. Each melodic track plays
-its own wavetable synth voice or sends MIDI. The sequencer has an isomorphic
+An eight-track MIDI sequencer for norns and a grid 128. It has an isomorphic
 keyboard and a chord keyboard, trig conditions, Metropolix-style stages,
-clips and snapshots. Track 8 transposes or harmonises the other seven. The
-synths and the drums all go through one master COLOUR stage.
+clips and snapshots. Track 8 transposes or harmonises the other seven.
 
 ## Install
 
@@ -15,32 +12,7 @@ In maiden's REPL:
 ;install https://github.com/FoundSoundsMM/VibeComposer
 ```
 
-Then **restart norns** (SYSTEM > RESTART) so it compiles the engine, and
-pick VIBECOMPOSER from the norns SELECT menu. Restart again after any update
-that changes `lib/Engine_VibeComposer.sc`. If the drum screen says RESTART
-NORNS, the engine running is out of date. vibe composer and drumdrum can be
-installed side by side.
-
-## Scenes
-
-**K2 and K3** step through three scenes, round and round:
-
-- **MELODIC:** the eight-track sequencer.
-- **DRUMS:** the drum machine.
-- **COLOUR:** the master output effects, with the punch-in effects on the
-  grid.
-
-A scene only decides what the grid and the screen show. Both sequencers
-always play together, from one PLAY and STOP, one tempo, one swing and one
-song position. The two grids put the things they share in the same places:
-
-- steps on rows A-D
-- the tracks on row G, columns 1-8
-- PLAY, STOP and SET on row H
-- COND / PROB on F1, PULSES / MODE on F4 and RAIN on F8
-
-STOP held is the clear modifier on both grids, and SET held is the other
-modifier.
+Then pick VIBECOMPOSER from the norns SELECT menu.
 
 ## Grid
 
@@ -49,11 +21,11 @@ modifier.
   A  [ steps 1-8                          ]  .    M    [           ]
   B  [ steps 9-16                         ]  .    C    [ keyboard  ]
   C  [ steps 17-24                        ]  .    .    [    or     ]
-  D  [ steps 25-32                        ]  .    .    [  chords   ]
-  E  [ step pages                         ]  .    .    [           ]
+  D  [ steps 25-32   (K2 / K3: pages)     ]  .    .    [  chords   ]
+  E    .    .    .    .    .    .    .    .    .    .    [           ]
   F    TC1  TC2  .    TC3  TC4  .    GEN  RAIN .    .    [           ]
   G    T1   T2   T3   T4   T5   T6   T7   T8   .    OCT+ [           ]
-  H    PLAY STOP REC  .    .    .    SYN  SET  .    OCT- [ root      ]
+  H    PLAY STOP REC  .    .    .    .    SET  .    OCT- [ root      ]
 ```
 
 ### Steps
@@ -78,10 +50,8 @@ lasts up to and including the second, and the steps it covers glow dimly.
 Press the same pair again to set it back to one step. Turning GATE on TC1
 also sets it back.
 
-A track can be up to 512 steps long. The grid shows 32 at a time, and row
-E picks which 32. Each pad is a page, lit as far as the clip goes. The page
-showing is bright and the page playing is a little brighter than the rest.
-Past eight pages each pad covers two: press it again for the second. Dim pads mark the beats and bars of the time
+A track can be up to 512 steps long. The grid shows 32 at a time: K2 and K3
+page back and forward. Dim pads mark the beats and bars of the time
 signature. A brighter step has trig settings, and a very dim one is
 skipped.
 
@@ -108,16 +78,14 @@ skipped.
   octave, up to three each way. Press both together to reset.
 - **SET** switches the grid to the session view and back.
 - **SET + a track** opens that track's settings.
-- **SET + a step** sets the clip's length: it ends on that step.
-- **SYN** opens the selected track's SYNTH page.
 
 Pressing a page's button again goes back to HOME.
 
 ## Screen
 
-E1 picks the lane, and E2 and E3 change its left and right parameters. A
-page with more than three lanes scrolls as E1 moves. K1 switches between
-HOME and the last page you had open. K2 and K3 change scene.
+E1 picks the lane, and E2 and E3 change its left and right parameters. K2
+and K3 page the steps back and forward. K1 switches between HOME and the
+last page you had open.
 
 | page | lane 1 | lane 2 | lane 3 |
 |---|---|---|---|
@@ -131,8 +99,7 @@ HOME and the last page you had open. K2 and K3 change scene.
 | KEYS | LAYOUT (4ths, 3rds, 5ths, seq), ROOT | IN-KEY, VELOCITY | VOICE of the selected track (POLY / MONO) |
 | CHORD | ROOT, VELOCITY | STRUM (ms), V.LEAD | ARP (off, up, down, up-down, random), RATE (1/32 to 1/4, with triplets) |
 | SETTINGS | SCALE, TEMPO | SWING, SIGNATURE | TRANSPOSE (chromatic / in key) |
-| TRACK SETTINGS | OUTPUT (SYNTH / MIDI), MUTE | DEVICE, CHANNEL (MIDI) | FOLLOW, OCTAVE; then PROGRAM (MIDI) |
-| SYNTH | see Synth | | |
+| TRACK SETTINGS | DEVICE, CHANNEL | FOLLOW, MUTE | OCTAVE, PROGRAM |
 
 On a TC page, E2 and E3 change the steps you are holding. With no steps
 held, they set what new steps start with.
@@ -185,148 +152,6 @@ global swing.
   synth glide.
 - **NOTE** moves the held steps' notes by a semitone, or by a scale step
   when IN-KEY is on.
-
-## Synth
-
-Every track plays the engine's wavetable voice unless TRACK SETTINGS >
-OUTPUT is set to MIDI. It morphs through a bank of single-cycle waves the
-way the Synthesis Technology E350 Morphing Terrarium does. Every wave in a
-bank shares its harmonics' phases and its loudness, and the voice
-crossfades between neighbouring waves sample by sample. Turning WAVE slides
-the timbre without thinning, pumping or stepping. Each wave has a
-band-limited copy per octave, so high notes don't alias.
-
-There are eight banks of 32 waves, each running dark to bright, built from
-Adventure Kid's AKWF single-cycle waveforms (CC0; see
-`lib/wavetables/README.md`): BASIC, HARMONIC, OVERTONE, VOICE, ORGAN, FM,
-CHIP and DIGITAL.
-
-The SYNTH page (SYN, H7) has thirteen lanes. E1 scrolls through them, and
-the header names the group:
-
-| group | left | right |
-|---|---|---|
-| OSC | BANK | WAVE: where in the bank, 0-100 |
-| OSC | SUB: a sine an octave down | FINE: cents |
-| FILTER | CUTOFF (OPEN at the top) | RES |
-| FG1 AMP | RISE | FALL |
-| FG1 AMP | CURVE: linear to exponential | MODE |
-| FG2 MOD | RISE | FALL |
-| FG2 MOD | CURVE | MODE |
-| FG2 MOD | TO WAVE: how far FG2 moves WAVE, either way | TO CUT: how far it moves CUTOFF |
-| LFO | RATE | SHAPE (SINE TRI SAW RAMP SQUARE S+H) |
-| LFO | DEPTH | DEST: PITCH, WAVE, CUTOFF or AMP |
-| MIX | LEVEL | PAN |
-| MIX | DELAY send | SPRING send |
-| MIX | DRIVE | GLIDE (MONO tracks) |
-
-The two function generators rise and fall on exponential curves. **FG1**
-shapes the volume and **FG2** the modulation. Each has a MODE:
-
-- **AD** rises and falls once, however long the note is.
-- **ASR** rises, holds while the note does, and falls when it ends.
-- **CYCLE** rises and falls over and over while the note is held.
-
-FG1's MODE takes effect from the next note.
-
-KEYS > VOICE set to MONO makes the voice monophonic. Legato notes, from
-SLIDE steps or keys held over each other, glide over GLIDE without
-retriggering. A poly track plays up to eight notes, and a ninth takes the
-oldest one's place.
-
-Each synth track has its own channel strip into the master COLOUR, with
-the delay and spring sends. A drum track picked as the DUCK source pumps
-the synths too. The SYNTH settings are part of the track, so they save with
-the project and go into snapshots. A project from before the synth keeps
-every track on MIDI.
-
-## Drums
-
-The drum machine is drumdrum's, so it has the same eight voices (BD1 BD2
-CLP SNR PRC1 PRC2 HAT CYM), four kits (WARM, WOOD, FM and ADD), a sample
-under every voice, per-step locks and conditions, four clips a track and
-the sampler. Its grid is laid out to match the melodic one:
-
-```
-       1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16
-  A-D  [ the selected track's 64 steps, 16 a row                                    ]
-  E    T1   T2   T3   T4   S1   S2   S3   S4   N1   N2   L1   L2   C1   C2   .    .
-  F    TC1  TC2  TC3  P1   P2   TC4  .    RAIN .    .    .    .    .    .    .    .
-  G    TR1  TR2  TR3  TR4  TR5  TR6  TR7  TR8  .    .    .    .    .    .    .    .
-  H    PLAY STOP .    .    .    .    .    SET  .    .    .    .    .    SWING MIX  COLOUR
-```
-
-- **Steps:** tap to add or remove a step. Hold steps and turn a control to
-  lock values to those steps.
-- **Controls:** hold one and turn E2 / E3. T is the voice, S the sample, N
-  noise, L the LFOs and C drive and sends. TC1 is COND / PROB, TC2 VEL /
-  NUDGE, TC3 PITCH / MIX and TC4 FLAM / DECAY. P1 is PULSES / MODE and P2
-  RAMP / BEND.
-- **LFO:** hold L1 or L2 together with a control, then turn E2 or E3 to
-  patch it to that side. Keep turning to set the depth. With an LFO held,
-  K3 changes its shape.
-- **Tracks** (row G): tap to select. Tap the selected track again to hear
-  it.
-- **RAIN** (held): E2 sets how much random hits rain across the voices.
-- **SWING** (held): E2 sets the swing, which is the melodic side's swing as
-  well. E3 sets the drums' swing grid.
-- **MIX** shows a fader and meter over each track and pan on the right.
-  The track pads mute.
-- **COLOUR** goes to the COLOUR scene.
-- **SET on its own** opens the drum session view: four clips over each
-  track, the kits on E1-E4 (tap one for every track, or hold one and press
-  tracks), and the song's snapshots on the right, the same 48 pads as the
-  melodic session view.
-
-| STOP (held) + | |
-|---|---|
-| step | back to a plain hit |
-| track | the playing clip emptied |
-| control | reset, or its locks taken off the held steps |
-| clip | emptied |
-| snapshot (hold) | deleted |
-
-| SET (held) + | |
-|---|---|
-| step | the track's length |
-| S1 + step | record a sample that many steps long |
-| control | keep it open |
-| track | hear the track |
-| E2 / E3 | change every track |
-| COLOUR (held) | the hidden TAPE loop |
-
-On the screen, E1 picks the track, or LENGTH / TIMING and DIRECTION / DILLA
-on the main page. E2 and E3 set the two values shown. K1 held is fine
-adjust.
-
-Under Link or MIDI clock, the drums and the synth tracks are sent early by
-`PARAMS > SYNC > sync lead` (30 ms by default). This makes up for the delay
-in norns' audio output. To set it, record a kick into your DAW. If it lands
-late, raise the lead by that many milliseconds; if early, lower it.
-
-## COLOUR
-
-The COLOUR scene is the master output. Every synth track and every drum
-goes through it. The screen is drumdrum's COLOUR page: the drum buss,
-ducker, texture, delay and spring reverb. E1 picks a setting, and E2 / E3
-change it.
-
-```
-       1     2     3 ..................................... 15    16
-  A-D  [ PERFORM: 64 punch-in effects, eight strips of eight          ]
-  F    BANK< BANK> .                                         .     BYPASS
-  G    [ melodic tracks 1-8: mute  ] [ drum tracks 1-8: mute          ]
-  H    PLAY  STOP  .    .    .    .    .    SET  .   ...      .     TAPE
-```
-
-- **PERFORM:** hold a pad to play it, and SET + pad to latch it. STOP + pad
-  lets go of its strip's latch. While playing, a press waits for the next
-  beat (PARAMS > PERFORM > quantize). The screen shows the effects while a
-  pad is held.
-- **BANK** steps through the COLOUR banks (BUSS, DUCK, TEXTURE, SPACE).
-- **Row G** mutes: lit is heard.
-- **TAPE** (held) loops the last stretch of the mix. E2 sets its pitch and
-  E3 its length.
 
 ## Rain
 
@@ -442,8 +267,8 @@ FOLLOW (in TRACK SETTINGS) turns following off for a track.
   - An empty slot launches as a new empty clip one bar long.
   - Hold a clip and tap another to copy it. This works between tracks too.
   - Hold STOP and tap a clip to empty it.
-- **Snapshots** are the keyboard's 48 pads. They are the same pads in the
-  drum session view. A snapshot holds every setting:
+- **Snapshots** are the keyboard's 48 pads. A snapshot holds every
+  setting:
   - every track's clips and steps, and its settings: swing, direction,
     probability, rain, device, channel, follow, mute, octave and program
   - the key, scale, transpose mode, swing, signature and tempo. The tempo
@@ -451,19 +276,15 @@ FOLLOW (in TRACK SETTINGS) turns following off for a track.
   - the keyboard and chord settings, latched modifiers, arp and octave
   - which keyboard is up (keys or chords), the selected track, the notes
     you played last, and track 8's live transposition
-  - every track's OUTPUT and SYNTH settings
-  - the whole drum machine: every drum sound, kit, sample, mix and LFO,
-    the patterns and their clips, and the master COLOUR
 
-  Loading a snapshot resends every MIDI track's program change. The MIDI
+  Loading a snapshot resends every track's program change. The MIDI
   clock-out ports aren't in snapshots, because they belong to the norns,
   not the song. Neither is norns' clock source.
   - Hold a pad until it fills to save.
   - Tap a pad to load it. While playing, it loads on the next bar and every
     track restarts from step 1.
   - Tap an empty pad for a new snapshot with every setting at its default
-    (empty clips, C major, 120 BPM, synth on every track, the drums as
-    the script starts them). It loads like any other,
+    (empty clips, C major, 120 BPM, channels 1-8). It loads like any other,
     so it's a blank song to start from.
   - Hold STOP and hold a pad to delete it.
 
@@ -500,11 +321,6 @@ it. Snapshots are saved as you make them. Both live in
 
 ## Testing
 
-`lib/tools/check-engine.sh` compiles the engine against SuperCollider on a
-desktop and builds every SynthDef. With `--render` it also plays the synth
-voice through scsynth offline and checks that every voice frees itself, and
-with `--live` it drives the engine's commands on a running server.
-
 `lua lib/tools/check.lua` runs the script on a desktop against a fake norns
 clock and MIDI ports. It checks:
 
@@ -512,8 +328,4 @@ clock and MIDI ports. It checks:
 - transposition, the scale following, directions, note lengths,
   arpeggios and rain
 - recording, conditions, clips and snapshots
-- the synth: keys and steps reach it, the SYNTH page, OUTPUT
-- the drums: grid layout and modifiers, drums and synth landing together
-  on one clock, PLAY / pause / STOP, the session view, snapshots that carry
-  the drums, the COLOUR scene
 - that no text on any screen overlaps

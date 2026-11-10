@@ -109,8 +109,7 @@ local function play(notes, vel, strum)
   end
   local function one(n)
     if tr.mute then return end
-    local port, ch = O.dest(tr, t)
-    local k, tok = O.on(port, ch, out_note(tr, n), vel)
+    local k, tok = O.on(tr.dev, tr.ch, out_note(tr, n), vel)
     sent[#sent + 1] = { k, tok }
   end
   if strum and (strum.ms or 0) > 0 and #order > 1 then
@@ -169,8 +168,7 @@ function Kb.arp_tick(x)
   local tr = St.track(Kb.sel())
   a.off = {}
   if not tr.mute then
-    local port, ch = O.dest(tr, Kb.sel())
-    local k, tok = O.on(port, ch, out_note(tr, n), a.vel)
+    local k, tok = O.on(tr.dev, tr.ch, out_note(tr, n), a.vel)
     a.off[1] = { k, tok }
   end
   a.off_at = x + math.max(1, math.floor(rate / 2))

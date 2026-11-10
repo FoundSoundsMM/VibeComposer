@@ -6,15 +6,11 @@
 -- A track has four clips (Ableton-style slots). The clip that plays is
 -- tr.clips[tr.clip]; editing the steps edits that clip.
 --
--- A track plays the engine's wavetable voice (out = 1, its settings in tr.syn) or
--- MIDI (out = 2, on dev / ch).
---
 -- A step is { notes = { midi notes }, sc = the scale they were written in,
 -- and any of K.STEP_DEF's keys that differ from the default }. Optional:
 -- len (a note held over that many steps), strum, arp.
 
 local K = include("lib/const")
-local Syn = include("lib/synth")
 
 local St = {}
 St.T = include("lib/theory")
@@ -34,8 +30,6 @@ function St.new_track(i)
   local clips = {}
   for c = 1, K.NCLIPS do clips[c] = St.new_clip() end
   return {
-    out = 1,            -- 1 SYNTH (the engine's wavetable voice), 2 MIDI
-    syn = Syn.new(),    -- the synth voice's settings (lib/synth)
     swing = 0,          -- offset on the global swing, in percent
     dev = 1,            -- MIDI port (norns vport 1-16)
     ch = i,             -- MIDI channel
@@ -57,7 +51,7 @@ end
 
 function St.new()
   local d = {
-    v = 2,              -- 2: tracks have an OUTPUT (synth or MIDI)
+    v = 1,
     tracks = {},
     scale = 1,
     root = 48,          -- C3: the keyboard's bottom-left pad and the key
@@ -140,26 +134,21 @@ end
 
 -- an older or broken file is filled in from a fresh project
 local function fill(d)
-  -- from before the synth every track was MIDI, and stays so
-  local midi_era = (d.v or 1) < 2
   local n = St.new()
   for k, v in pairs(n) do
     if d[k] == nil then d[k] = v end
   end
   for i = 1, K.NTRACKS do
     local tr = d.tracks[i] or St.new_track(i)
-    if midi_era and tr.out == nil then tr.out = 2 end
     for k, v in pairs(St.new_track(i)) do
       if tr[k] == nil then tr[k] = v end
     end
-    tr.syn = Syn.fill(tr.syn)
     for c = 1, K.NCLIPS do
       tr.clips[c] = tr.clips[c] or St.new_clip()
       tr.clips[c].dir = tr.clips[c].dir or 1
     end
     d.tracks[i] = tr
   end
-  d.v = 2
   return d
 end
 St.fill = fill

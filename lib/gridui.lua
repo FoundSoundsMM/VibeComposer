@@ -7,20 +7,10 @@
 --   B  [ steps 9-16                          ]  .    C    [  keyboard  ]
 --   C  [ steps 17-24                         ]  .    .    [     or     ]
 --   D  [ steps 25-32 (K2 / K3: other pages)  ]  .    .    [   chords   ]
---   E  [ step pages 1-8                     ]  .    .    [            ]
+--   E    .    .    .    .    .    .    .    .    .    .    [            ]
 --   F    TC1  TC2  .    TC3  TC4  .    GEN  RAIN .    .    [            ]
 --   G    T1   T2   T3   T4   T5   T6   T7   T8   .    OCT+ [            ]
---   H    PLAY STOP REC  .    .    .    SYN  SET  .    OCT- [ root ...   ]
---
--- The drum grid (lib/dd) keeps the same places for what both have: steps
--- on A-D, tracks on G, PLAY STOP SET on H, COND/PROB on F1, PULSES/MODE on
--- F4, RAIN on F8. STOP held is the clear modifier on both, SET held the
--- other one.
---
--- PAGES. A track can be 512 steps, the grid shows 32: row E picks which.
--- Each pad is a page, lit as far as the clip goes, the one showing bright,
--- the one playing a little brighter than the rest. Past eight pages each pad
--- is two, and a second press shows the second.
+--   H    PLAY STOP REC  .    .    .    .    SET  .    OCT- [ root ...   ]
 --
 -- STEPS. Press an empty step and it takes the keys held right now, or the
 -- last ones played. Hold a step and play keys: they go into it, every key
@@ -32,8 +22,7 @@
 -- PLAY plays and pauses. Held while playing it is FILL. STOP stops and goes
 -- back to the top when it comes up; hold it and press a track to empty the
 -- clip that track is playing. SET toggles the session view (clips and snapshots, see
--- lib/snap). Hold SET and press a track: that track's settings; a step:
--- the clip's length. SYN opens the selected track's SYNTH page.
+-- lib/snap). Hold SET and press a track: that track's settings.
 
 local K = include("lib/const")
 local T = include("lib/theory")
@@ -137,15 +126,6 @@ end
 local function step_key(x, y, z)
   local i = ((G.steppage - 1) * K.PAGE_STEPS) + ((y - 1) * 8) + x
   local c = St.clip(G.sel)
-  if z == 1 and G.s_held then
-    -- SET + step: the clip ends here (as SET + step on the drum grid)
-    G.s_used = true
-    c.len = i
-    G.ignore[i] = true
-    P.show({ "LENGTH " .. i, "T" .. G.sel .. " clip " .. St.track(G.sel).clip, "" })
-    Q.dirty = true
-    return
-  end
   if z == 1 then
     local first = G.held[1]
     if first and first.i ~= i and St.has_notes(c.steps[first.i]) then
@@ -229,24 +209,8 @@ end
 
 -- ----------------------------------------------------------------- keys
 
--- row E: pad x shows page x, or past eight pages, pages 2x-1 and 2x
-local function page_key(x)
-  local n = G.pages()
-  local a, b = x, nil
-  if n > 8 then a, b = (2 * x) - 1, 2 * x end
-  if a > n then return end
-  local to = a
-  if b and b <= n and G.steppage == a then to = b end
-  G.page(to - G.steppage)
-end
-
 local function key_main(x, y, z)
   if x <= 8 and y <= 4 then return step_key(x, y, z) end
-  if y == K.PAGE_ROW and x <= 8 then
-    if z == 1 then page_key(x) end
-    Q.dirty = true
-    return
-  end
 
   if Kb.in_area(x, y) then
     if z == 1 then
@@ -289,7 +253,6 @@ local function key_main(x, y, z)
   elseif is("TC2", x, y) then page_btn("tc2")
   elseif is("TC3", x, y) then page_btn("tc3")
   elseif is("TC4", x, y) then page_btn("tc4")
-  elseif is("SYNTH", x, y) then page_btn("synth")
   elseif is("GEN", x, y) then
     if P.page == "gen" then
       Gn.generate(G.sel)
@@ -478,24 +441,6 @@ local function draw_steps()
   end
 end
 
--- row E: the pages
-local function draw_pages()
-  local n = G.pages()
-  if n <= 1 then return end
-  local per = (n > 8) and 2 or 1
-  local playing = (Q.playing or Q.paused) and Q.rt[G.sel].ph or 0
-  local ppage = (playing > 0) and math.ceil(playing / K.PAGE_STEPS) or 0
-  for x = 1, 8 do
-    local a = ((x - 1) * per) + 1
-    if a <= n then
-      local l = 2
-      if ppage >= a and ppage < a + per then l = 6 end
-      if G.steppage >= a and G.steppage < a + per then l = 12 end
-      led(x, K.PAGE_ROW, l)
-    end
-  end
-end
-
 local function draw_keys()
   local t = G.sel
   local d = St.d
@@ -559,7 +504,6 @@ local function draw_buttons()
   page("TC3", "tc3")
   page("TC4", "tc4")
   page("GEN", "gen")
-  page("SYNTH", "synth")
   -- RAIN glows with the selected track's rain
   local tr = St.track(G.sel)
   local wet = ((tr.rain or 0) > 0) and not tr.rain_off
@@ -629,33 +573,10 @@ local function draw_snaps()
   end
 end
 
--- FILL once PLAY has been held long enough (whichever grid is up)
-function G.fill_tick()
-  if G.play_t0 and Q.playing and (now() - G.play_t0) >= FILL_HOLD then Q.fill = true end
-end
-
--- the snapshot pads, for the drum session view too (same pads, same place)
-function G.draw_snaps(f)
-  for i = 1, 128 do buf[i] = 0 end
-  draw_snaps()
-  for y = 1, 8 do
-    for x = K.KEY_X0, 16 do f(x, y, buf[((y - 1) * 16) + x]) end
-  end
-end
-
--- PLAY and STOP, for the other scenes' grids
-function G.draw_transport(f)
-  for i = 1, 128 do buf[i] = 0 end
-  draw_transport()
-  for _, id in ipairs({ "PLAY", "STOP" }) do
-    local b = K.BTN[id]
-    f(b[1], b[2], buf[((b[2] - 1) * 16) + b[1]])
-  end
-end
-
 function G.redraw()
   if not G.g then return end
-  G.fill_tick()
+  -- FILL once PLAY has been held long enough
+  if G.play_t0 and Q.playing and (now() - G.play_t0) >= FILL_HOLD then Q.fill = true end
   for i = 1, 128 do buf[i] = 0 end
   draw_transport()
   if G.settings then
@@ -663,7 +584,6 @@ function G.redraw()
     draw_snaps()
   else
     draw_steps()
-    draw_pages()
     draw_buttons()
     if Kb.mode == 1 then draw_keys() else draw_chords() end
   end
