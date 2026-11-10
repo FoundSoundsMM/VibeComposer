@@ -2,6 +2,10 @@
 --
 -- Notes out, MIDI clock out, transport out.
 --
+-- SYNTH. A track whose OUTPUT is SYNTH plays the engine's wavetable voice. Its
+-- notes go through here all the same, on port 0 with the track as the
+-- channel (O.dest), so the token bookkeeping below covers them too.
+--
 -- NOTES. Every note on is remembered by port, channel and note, with a
 -- token. Its note off only goes out while that token is still the one
 -- sounding, so a note retriggered before its old note off (a slide, a
@@ -22,6 +26,8 @@ local O = {}
 O.ports = {}        -- vport n -> midi.connect(n)
 O.active = {}       -- key -> token
 O.clock_out = {}    -- vport n -> true
+O.SYNTH = 0         -- the port a synth track's notes go to
+O.synth = nil       -- set by the script: { on = f(t, note, vel), off = f(t, note) }
 local tok = 0
 local borrowed = {} -- norns clock_midi_out_n we turned off, to give back
 
@@ -41,14 +47,36 @@ local function call(port, f, ...)
   if d and d[f] then pcall(d[f], d, ...) end
 end
 
+-- where track t's notes go: port and channel
+function O.dest(tr, t)
+  if (tr.out or 1) == 1 then return O.SYNTH, t end
+  return tr.dev, tr.ch
+end
+
+local function note_on(port, ch, note, vel)
+  if port == O.SYNTH then
+    if O.synth then O.synth.on(ch, note, vel) end
+  else
+    call(port, "note_on", note, vel, ch)
+  end
+end
+
+local function note_off(port, ch, note)
+  if port == O.SYNTH then
+    if O.synth then O.synth.off(ch, note) end
+  else
+    call(port, "note_off", note, 0, ch)
+  end
+end
+
 local function key(port, ch, note) return (port * 4096) + (ch * 128) + note end
 
 function O.on(port, ch, note, vel)
   local k = key(port, ch, note)
-  if O.active[k] then call(port, "note_off", note, 0, ch) end
+  if O.active[k] then note_off(port, ch, note) end
   tok = tok + 1
   O.active[k] = tok
-  call(port, "note_on", note, vel, ch)
+  note_on(port, ch, note, vel)
   return k, tok
 end
 
@@ -57,7 +85,7 @@ function O.off(k, token)
   O.active[k] = nil
   local port = math.floor(k / 4096)
   local ch = math.floor((k % 4096) / 128)
-  call(port, "note_off", k % 128, 0, ch)
+  note_off(port, ch, k % 128)
 end
 
 function O.all_off()

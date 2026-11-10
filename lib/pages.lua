@@ -13,7 +13,10 @@
 --   KEYS      LAYOUT | ROOT, IN-KEY | VELOCITY
 --   CHORD     ROOT | VELOCITY, STRUM | V.LEAD, ARP | RATE
 --   SETTINGS  SCALE | TEMPO, SWING | SIGNATURE, TRANSPOSE
---   TRACK SETTINGS  DEVICE | CHANNEL, FOLLOW | MUTE, OCTAVE | PROGRAM
+--   TRACK SETTINGS  OUTPUT | MUTE, DEVICE | CHANNEL, FOLLOW | OCTAVE,
+--             PROGRAM
+--   SYNTH     the selected track's wavetable voice (lib/synth): OSC, FILTER, FG1, FG2,
+--             LFO, MIX. A page with more than three lanes scrolls with E1.
 --
 -- On the TC pages, with steps held, E2 and E3 change those steps. With
 -- none held they change what a NEW step starts with.
@@ -28,14 +31,14 @@ local K = include("lib/const")
 local T = include("lib/theory")
 
 local P = {}
-local St, Q, Kb, G, Gn, O
+local St, Q, Kb, G, Gn, O, Syn
 
 P.page = "home"
 P.lane = {}
 P.rot, P.shf = 0, 0
 
-function P.init(state, seq, keys, grid, gen, out)
-  St, Q, Kb, G, Gn, O = state, seq, keys, grid, gen, out
+function P.init(state, seq, keys, grid, gen, out, synth)
+  St, Q, Kb, G, Gn, O, Syn = state, seq, keys, grid, gen, out, synth
 end
 
 local function clamp(v, lo, hi) return math.min(math.max(v, lo), hi) end
@@ -340,6 +343,20 @@ DEFS.keys = {
       { name = "VELOCITY", get = function() return tostring(St.d.vel) end,
         delta = function(d) St.d.vel = clamp(St.d.vel + d, 1, 127) end },
     },
+    {
+      -- the selected track's voice: MONO for a monosynth
+      { name = function() return "T" .. G.sel .. " VOICE" end,
+        get = function() return St.track(G.sel).mono and "MONO" or "POLY" end,
+        delta = function(d)
+          local tr = St.track(G.sel)
+          if tr.mono == (d > 0) then return end
+          Kb.release_all()
+          tr.mono = d > 0
+          if Syn then Syn.push(G.sel) end
+          P.show(tr.mono and { "T" .. G.sel .. " MONO", "new note priority:", "one key at a time" }
+            or { "T" .. G.sel .. " POLY", "keys held together", "play a chord" })
+        end },
+    },
   },
 }
 
@@ -407,17 +424,37 @@ DEFS.settings = {
 
 local function ts() return St.track(P.tset_track or G.sel) end
 
+local function tset_t() return P.tset_track or G.sel end
+local function is_midi() return (ts().out or 1) == 2 end
+
 DEFS.tset = {
-  title = function() return "T" .. (P.tset_track or G.sel) .. " SETTINGS" end,
+  title = function() return "T" .. tset_t() .. " SETTINGS" end,
   info = function() return "" end,
   lanes = {
     {
-      { name = "DEVICE", get = function() return O.name(ts().dev) end,
+      -- first: what the track plays, the engine's wavetable voice or MIDI
+      { name = "OUTPUT", get = function() return is_midi() and "MIDI" or "SYNTH" end,
+        delta = function(d)
+          local v = clamp((ts().out or 1) + sgn(d), 1, 2)
+          if v == (ts().out or 1) then return end
+          O.all_off()
+          ts().out = v
+          if Syn then Syn.push(tset_t()) end
+          if v == 2 then O.program(ts().dev, ts().ch, ts().prog) end
+        end },
+      { name = "MUTE", get = function() return onoff(ts().mute) end,
+        delta = function(d)
+          ts().mute = d > 0
+          if Syn then Syn.push(tset_t()) end
+        end },
+    },
+    {
+      { name = "DEVICE", get = function() return is_midi() and O.name(ts().dev) or "--" end,
         delta = function(d)
           O.all_off()
           ts().dev = clamp(ts().dev + sgn(d), 1, 16)
         end },
-      { name = "CHANNEL", get = function() return tostring(ts().ch) end,
+      { name = "CHANNEL", get = function() return is_midi() and tostring(ts().ch) or "--" end,
         delta = function(d)
           O.all_off()
           ts().ch = clamp(ts().ch + sgn(d), 1, 16)
@@ -426,26 +463,54 @@ DEFS.tset = {
     {
       { name = "FOLLOW",
         get = function()
-          if (P.tset_track or G.sel) == K.MASTER then return "MASTER" end
+          if tset_t() == K.MASTER then return "MASTER" end
           return onoff(ts().follow)
         end,
         delta = function(d)
-          if (P.tset_track or G.sel) ~= K.MASTER then ts().follow = d > 0 end
+          if tset_t() ~= K.MASTER then ts().follow = d > 0 end
         end },
-      { name = "MUTE", get = function() return onoff(ts().mute) end,
-        delta = function(d) ts().mute = d > 0 end },
-    },
-    {
       { name = "OCTAVE", get = function() return signed(ts().oct) end,
         delta = function(d) ts().oct = clamp(ts().oct + sgn(d), -4, 4) end },
-      { name = "PROGRAM", get = function() return (ts().prog < 0) and "--" or tostring(ts().prog + 1) end,
+    },
+    {
+      { name = "PROGRAM",
+        get = function()
+          if not is_midi() then return "--" end
+          return (ts().prog < 0) and "--" or tostring(ts().prog + 1)
+        end,
         delta = function(d)
           local t = ts()
           t.prog = clamp(t.prog + d, -1, 127)
-          O.program(t.dev, t.ch, t.prog)
+          if is_midi() then O.program(t.dev, t.ch, t.prog) end
         end },
+      nil,
     },
   },
+}
+
+-- SYNTH: the selected track's wavetable voice, a lane per row of Syn.LANES
+local function syn_param(key)
+  if not key then return nil end
+  return {
+    name = function() return Syn.name(key) end,
+    get = function() return Syn.fmt(G.sel, key) end,
+    delta = function(d)
+      -- a list (waves, modes) a detent at a time; a 0-100 knob as fast as turned
+      local p = Syn.SPEC[key]
+      Syn.delta(G.sel, key, ((p[3] - p[2]) > 20) and d or sgn(d))
+    end,
+  }
+end
+
+DEFS.synth = {
+  title = function() return "SYNTH T" .. sel() end,
+  info = function()
+    local lane = Syn and Syn.LANES[P.lane_of("synth")]
+    local s = lane and lane[1] or ""
+    if (tr().out or 1) == 2 then s = s .. " (MIDI)" end
+    return s
+  end,
+  lanes = {},
 }
 
 P.DEFS = DEFS
@@ -457,6 +522,13 @@ function P.open(page)
   P.page = page
   if page ~= "home" and page ~= "settings" then P.last = page end
   Q.dirty = true
+end
+
+-- the SYNTH page's lanes, once lib/synth is known
+function P.build_synth()
+  local lanes = {}
+  for i, l in ipairs(Syn.LANES) do lanes[i] = { syn_param(l[2]), syn_param(l[3]) } end
+  DEFS.synth.lanes = lanes
 end
 
 function P.lane_of(page)
@@ -544,16 +616,21 @@ local function header(title, info)
   screen.stroke()
 end
 
+local function pname(p)
+  if type(p.name) == "function" then return p.name() end
+  return p.name
+end
+
 local function draw_param(x, y0, h, p, on)
   if not p then return end
   local v = p.get()
   local lvl = on and 15 or 3
   if h >= 24 then
-    txt(x, y0 + 8, p.name, on and 6 or 2)
+    txt(x, y0 + 8, pname(p), on and 6 or 2)
     if #v <= 5 then txt(x, y0 + 22, v, lvl, 16)
     else txt(x, y0 + 20, v, lvl) end
   else
-    txt(x, y0 + 7, p.name, on and 6 or 2)
+    txt(x, y0 + 7, pname(p), on and 6 or 2)
     txt(x, y0 + 15, v, lvl)
   end
 end
@@ -563,8 +640,18 @@ local function draw_page(def, page)
   local nl = #def.lanes
   local h = (nl <= 2) and 26 or 17
   local cur = P.lane_of(page)
-  for i, lane in ipairs(def.lanes) do
-    local y0 = 11 + ((i - 1) * h)
+  -- more than three lanes: the three around the one E1 is on
+  local first = 1
+  if nl > 3 then
+    first = clamp(cur - 1, 1, nl - 2)
+    -- where the window is, down the right edge
+    screen.level(2)
+    screen.rect(127, 12 + math.floor(((first - 1) / nl) * 51), 1, math.max(2, math.floor((3 / nl) * 51)))
+    screen.fill()
+  end
+  for i = first, math.min(nl, first + 2) do
+    local lane = def.lanes[i]
+    local y0 = 11 + ((i - first) * h)
     local on = (i == cur)
     if on then
       screen.level(15)

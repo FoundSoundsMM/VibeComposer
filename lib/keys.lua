@@ -24,6 +24,10 @@
 -- clock instead of all at once, and a step recorded from it arpeggiates
 -- too. With ARP on there is no strum.
 --
+-- MONO (KEYS page, per track) is for monosynths: new-note priority. A new
+-- key cuts the one sounding; let it go and the newest key still held comes
+-- back. Keys held together don't make a chord: a step takes the newest.
+--
 -- Whatever was played last (keys held together, or a chord) is what a step
 -- takes when it is pressed.
 
@@ -105,7 +109,8 @@ local function play(notes, vel, strum)
   end
   local function one(n)
     if tr.mute then return end
-    local k, tok = O.on(tr.dev, tr.ch, out_note(tr, n), vel)
+    local port, ch = O.dest(tr, t)
+    local k, tok = O.on(port, ch, out_note(tr, n), vel)
     sent[#sent + 1] = { k, tok }
   end
   if strum and (strum.ms or 0) > 0 and #order > 1 then
@@ -164,7 +169,8 @@ function Kb.arp_tick(x)
   local tr = St.track(Kb.sel())
   a.off = {}
   if not tr.mute then
-    local k, tok = O.on(tr.dev, tr.ch, out_note(tr, n), a.vel)
+    local port, ch = O.dest(tr, Kb.sel())
+    local k, tok = O.on(port, ch, out_note(tr, n), a.vel)
     a.off[1] = { k, tok }
   end
   a.off_at = x + math.max(1, math.floor(rate / 2))
@@ -175,8 +181,21 @@ local function arp_stop()
   Kb.arp = nil
 end
 
+-- the selected track is MONO and the keys keyboard is up
+function Kb.mono()
+  return Kb.mode == 1 and St.track(Kb.sel()).mono == true
+end
+
+-- keys held together add up to a chord
+function Kb.stacks() return Kb.mode == 1 and not Kb.mono() end
+
 -- every note held on the keyboard right now, in press order
+-- (MONO: only the one sounding)
 function Kb.held_notes()
+  if Kb.mono() then
+    local p = Kb.pads[#Kb.pads]
+    return p and { p.notes[1] } or {}
+  end
   local out, seen = {}, {}
   for _, p in ipairs(Kb.pads) do
     for _, n in ipairs(p.notes) do
@@ -229,9 +248,19 @@ function Kb.press(x, y)
   if Kb.mode == 1 then
     local n = Kb.note_at(x, y)
     local p = { x = x, y = y, notes = { n } }
+    local mono = Kb.mono()
+    if mono then
+      -- new-note priority: the note sounding stops first
+      local q = Kb.pads[#Kb.pads]
+      if q then stop(q.sent) q.sent = nil end
+    end
     p.sent = play(p.notes, St.d.vel)
     Kb.pads[#Kb.pads + 1] = p
-    remember({ n }, St.d.vel, nil, nil, fresh)
+    remember({ n }, St.d.vel, nil, nil, fresh or mono)
+    if mono then
+      Kb.show({ K.note_name(n), "MONO", "", hold = true })
+      return p.notes
+    end
     local held = Kb.held_notes()
     Kb.show({ names(held), T.detect(held) or ((#held == 1) and "" or "?"), "", hold = true })
     return p.notes
@@ -274,10 +303,17 @@ end
 function Kb.release(x, y)
   for i, p in ipairs(Kb.pads) do
     if p.x == x and p.y == y then
+      local top = (i == #Kb.pads)
       stop(p.sent)
       table.remove(Kb.pads, i)
       if Kb.mode == 2 then arp_stop() end
-      if #Kb.pads == 0 then Kb.show(nil) end
+      if #Kb.pads == 0 then Kb.show(nil)
+      elseif top and Kb.mono() then
+        -- MONO: back to the newest key still held
+        local q = Kb.pads[#Kb.pads]
+        q.sent = play(q.notes, St.d.vel)
+        Kb.show({ K.note_name(q.notes[1]), "MONO", "", hold = true })
+      end
       return p
     end
   end

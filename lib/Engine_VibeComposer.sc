@@ -1,0 +1,2557 @@
+// Engine_VibeComposer
+// warm, dusty drum machine for norns -- 8 voices, each a synth and a sampler --
+// ported from drumdrum's engine, plus an FM synth on each of VibeComposer's 8
+// melodic tracks. norns runs one engine per script, so this one holds both:
+// the drums are drumdrum's, unchanged but for the names (Engine_VibeComposer,
+// vc_ defs, /vc_samp_hit), so the two can be installed side by side.
+//
+//   SYNTH: LFO (per track, kr) -> wavetable voices (per note) -> synth track bus
+//     -> its own STRIP (vc_strip, idx 9-16) -> the same mix bus, sends and
+//     COLOUR as the drums, ducked by the drum DUCK source (see SYNTH below)
+//
+//   voice (one-shot, per hit) -> track bus -> STRIP (per track, always on)
+//     -> mix bus -> PERFORM (punch-ins, only while held) -> COLOUR -> out
+//   STRIP -> delay send -> DELAY  \
+//   STRIP -> spring send -> SPRING -> mix bus (so COLOUR colours the space too)
+//   STRIP envelopes -> DUCK -> ducks the other strips and the returns
+//   mix bus -> TAPE RECORDER, a running buffer the loop punch-ins play back
+//   inputs / out / one track -> SAMPLER, a take written to disk (hold S1 + step)
+//
+// Lua does every range mapping and sends physical units. A voice's arguments
+// are cached here per track (\set) and the next \trig spawns a voice with
+// whatever the cache holds, so a parameter lock is just "set, then trig" and
+// costs nothing when nothing changed.
+//
+// Every voice shares one wrapper (*build): the voice's own body, a noise
+// layer (N1/N2), a sample layer (S1-S4), the step's synth/sample MIX, the
+// velocity curve, a choke gate and a silence detector that frees it.
+//
+// The STRIP is where the per-track COLOUR buttons live (drive, warmth and
+// the delay and spring sends) along with level, pan, tilt and mute, and it
+// writes the meter. COLOUR on the master is a drum buss after Ableton's
+// Drum Buss into Pappus' colour stage. DELAY and SPRING are shared by every
+// track, and any one track can DUCK the rest. PERFORM is the punch-in
+// effects, each a synth that lives only while its pad is held.
+//
+// ANALOGUE: nothing here is meant to sound the same twice. Three kinds of
+// imperfection, the way a real box has them:
+//   tolerance  every voice is built from parts that are a little off their
+//              nominal value -- partials slightly mistuned, the clap's
+//              bursts unevenly spaced. These are rolled once, from a fixed
+//              seed, when the SynthDefs are built, so this unit always has
+//              the same character, the way one 808 differs from the next.
+//   drift      each STRIP runs a slow, wandering pitch offset its voices read,
+//              so a track goes a few cents flat and sharp over minutes, like
+//              a warming circuit, and consecutive hits drift together.
+//   variance   every hit rolls its own pitch, decay, level and brightness,
+//              and free-running oscillators start wherever they happen to be.
+// Then the voice goes through a VCA that is not quite linear: velocity goes
+// in before it, so harder hits round over and grow a little second
+// harmonic. ANALOG scales all of it, 0 being a clean digital box. Each
+// STRIP adds VCA HISS under its fader, so it rises with the level, pumps
+// with the duck and stops with the mute.
+//
+// CPU: scsynth runs every UGen in a synth whether it is heard or not, so
+// nothing here pays for what is switched off. A voice with no noise and no
+// sample plays a lean twin without those layers; a COLOUR stage at zero,
+// the SPRING with nothing sent to it and the HISS while stopped are paused
+// (see *want). The SynthDefs are cached on disk after the first boot.
+
+Engine_VibeComposer : CroneEngine {
+
+	classvar <nTracks = 8;
+	classvar <nSynths = 8, <synPoly = 8;   // synth tracks, voices per track
+	classvar <defs, <leanDefs;
+	classvar <chokes;
+	classvar <colourStages;
+	classvar built;
+
+	var <tBus, <hissBus, <driftBus, <mixBus, <dryBus, <dlyBus, <sprBus, <meterBus, <ampBus, <scBus, <duckBus, <posBus;
+	var <voiceGroup, <stripGroup, <fxGroup, <perfGroup, <colourGroup;
+	var <strips, <hissS, <delayS, <springS, <colourS, <duckS, <recS;
+	var naps;         // per node that sleeps when idle: [awake, generation, pause pending]
+	var ssends, sdecay = 2.2;   // what the strips send the spring, and its decay
+	var <tape;       // the recorder's buffer
+	var <stages;     // one group per punch-in stage, in signal order
+	var <punches;    // per stage: the sounding punch-in synth, or nil
+	var <args;        // per track: IdentityDictionary of the voice's next arguments
+	var <bufs;        // per track: the loaded Buffer, or blank
+	var <blank;
+	var <live;        // per track: List of sounding voices, oldest first
+	var <tails;      // punch-ins let go of but still ringing out
+	var mlast, mtime = 0;
+	var analog = 0.5;
+	var <kits;       // per track: 0 WARM, 1 WOOD, 2 FM, 3 ADD
+	// the SAMPLER: a ring the armed recorder writes, and where a take is.
+	// sState: 0 off, 1 armed (lua will say when), 2 listening for a hit,
+	// 3 recording, 4 writing the file. sDone counts finished takes.
+	var <sRing, <sGroup, sSynth, sPosBus, sLvlBus, sHitFunc;
+	var sState = 0, sDone = 0, sStart = 0, sT0 = 0, sDur = 1, sGen = 0, sPath = "";
+	// the SYNTH tracks (index 0-7 in their commands): a mono audio bus each,
+	// the LFO's control bus, and a strip's private drift / meter / sidechain
+	// buses, so they never feed the drum meters or the DUCK. synHiss is one
+	// audio bus nothing writes, for the strips' hbus to read silence from.
+	var <synBus, <synLfoBus, <synDriftBus, <synMeterBus, <synScBus, <synHiss;
+	var <lfoGroup, <synParent, <synGroups;   // LFOs; a voice group per track
+	var <synStrips, <synLfos;
+	var <synArgs;     // per track: IdentityDictionary of the next notes' arguments
+	var <synVoices;   // per track: List of (node:, note:, gated:), oldest first
+	var <synHeld;     // per track: mono's held-note stack, most recent last
+	var <synMonoOn;   // per track: true in mono
+	var smlast, smtime = 0;
+	var <tables;      // the wavetables: 48 consecutive Buffers, or nil
+
+	*initClass {
+		// per kit, per track: WARM, WOOD, FM, ADD
+		defs = [
+			[\vc_bd1, \vc_bd2, \vc_clp, \vc_snr, \vc_prc1, \vc_prc2, \vc_hat, \vc_cym],
+			[\vc_wbd1, \vc_wbd2, \vc_wclp, \vc_wsnr, \vc_wprc1, \vc_wprc2, \vc_what, \vc_wcym],
+			[\vc_fbd1, \vc_fbd2, \vc_fclp, \vc_fsnr, \vc_fprc1, \vc_fprc2, \vc_fhat, \vc_fcym],
+			[\vc_abd1, \vc_abd2, \vc_aclp, \vc_asnr, \vc_aprc1, \vc_aprc2, \vc_ahat, \vc_acym]
+		];
+		leanDefs = defs.collect { |kit| kit.collect { |d| Engine_VibeComposer.leanName(d) } };
+		// a choked voice cuts the one before it; the rest overlap, up to six
+		chokes = [1, 1, 0, 1, 0, 0, 1, 0];
+		// COLOUR's stages in signal order, and the knob that wakes each one
+		// from its sleep (nil: always running)
+		colourStages = [
+			[\vc_c_in, nil], [\vc_c_comp, \comp], [\vc_c_drive, \drive], [\vc_c_crunch, \crunch],
+			[\vc_c_damp, nil], [\vc_c_trans, \trans], [\vc_c_boom, \boom], [\vc_c_mix, nil],
+			[\vc_c_loss, \loss], [\vc_c_noise, \noise], [\vc_c_wow, \wow], [\vc_c_chorus, \chorus],
+			[\vc_c_out, nil]
+		];
+	}
+
+	*new { arg context, doneCallback;
+		^super.new(context, doneCallback);
+	}
+
+	// ------------------------------------------------------------- layers
+
+	// N1 TYPE: white, pink, dust, tape, metal. Band-passed at N2 TONE.
+	// Select runs every source whichever it picks, so they share one white
+	// and one pink between them: only one is ever heard, so none can tell.
+	*noise { arg type, tone;
+		var w = WhiteNoise.ar, p = PinkNoise.ar;
+		var srcs = [
+			w,
+			p * 1.6,
+			(Dust2.ar(900) * 1.5) + (Decay2.ar(Dust.ar(30), 0.0002, 0.003) * w * 3),
+			LPF.ar(p * 2, 6000) * (1 + (LFNoise2.kr(5) * 0.3)),
+			// clocked sample-and-hold noise: bitty and metallic, pitched by TONE
+			Latch.ar(w, Impulse.ar(tone.clip(100, 20000) * 0.5))
+		];
+		^BPF.ar(Select.ar(type.clip(0, 4), srcs), tone.clip(40, 16000), 0.9) * 2.2
+	}
+
+	// S2 START/DECAY, S3 PITCH/TONE, S4 ATTACK/DIR. TONE is one knob for
+	// two filters: below centre a lowpass closes, above it a highpass opens.
+	*sampler { arg buf, start, dec, pitch, tone, atk, rev;
+		var frames = BufFrames.kr(buf);
+		var r = (rev > 0.5);
+		var pos = Select.kr(r, [start * frames, ((1 - start) * frames) - 2]).max(0);
+		var sig = PlayBuf.ar(1, buf, BufRateScale.kr(buf) * pitch.midiratio * (1 - (r * 2)),
+			1, pos, 0);
+		var env = EnvGen.ar(Env([0, 1, 0], [atk, dec], [0, -4]));
+		sig = LPF.ar(sig, (20000 * (0.015 ** tone.neg.max(0))).clip(80, 20000));
+		sig = HPF.ar(sig, (20 * (200 ** tone.max(0))).clip(20, 8000));
+		^sig * env
+	}
+
+	// --------------------------------------------------------------- voices
+	//
+	// Each body takes the eight TONE values (t: t1a t1b ... t4b), the pitch
+	// ratio, the step's decay multiplier and the GRAIN noise (already scaled),
+	// and returns [signal, amplitude envelope, attack time]. The envelope is
+	// what the noise layer rides on; the attack time keeps the silence
+	// detector from freeing a voice that has not got going yet.
+
+	// WARM is voiced after the MFB Tanzbar, from measurements of its own
+	// samples rather than its panel. What the analysis turned up, and what
+	// these voices do about it:
+	//   sweeps    a pitch envelope there is a capacitor discharging into an
+	//             oscillator's CV, so it falls in Hz, not in octaves: fast
+	//             at first and then a long, slow settle (the BD1 starts
+	//             near 200 Hz and is still settling at 100 ms). *rc is that
+	//             discharge, and harder hits charge it further.
+	//   tails     envelopes are RC decays too: exponential, so DECAY is the
+	//             time to -60 dB and the body hangs on the way a box does.
+	//   waves     the oscillators are not sines. Kick and toms carry a 3rd
+	//             (and on the toms a 2nd) harmonic 15-35 dB down, as a
+	//             sine leaves a transistor stage that is starting to clip.
+	//   loudness  a bridged-T rings a little sharp while it is loud, so the
+	//             808-type voices bend down as they die away.
+
+	// a capacitor discharging: 1 falling to nothing, time constant tau
+	*rc { arg tau;
+		^EnvGen.ar(Env([1, 0.001], [tau.max(0.0005) * 6.9], \exp))
+	}
+
+	// an RC decay to -60 dB after t60, with a short rounded attack. It has
+	// to land on 0 at the end: an exponential never gets there, and a voice
+	// left humming at -60 dB is never freed by its silence detector.
+	*rcenv { arg atk, t60;
+		^EnvGen.ar(Env([0, 1, 0.001, 0], [atk, t60.max(0.005), 0.005], [2, \exp, 0]))
+	}
+
+	// a sine through a transistor stage: GAIN grows the odd harmonics,
+	// BIAS tips it so the halves clip differently and the even ones come in.
+	// Peak stays at 1.
+	*stage { arg x, gain, bias;
+		^(((x * gain) + bias).tanh - bias.tanh) / ((gain + bias).tanh - bias.tanh)
+	}
+
+	// BD1: the Tanzbar's BD1, the one with the zap: an oscillator whose
+	// pitch falls from SWEEP octaves above PITCH with time constant S.TIME
+	// (the samples: ~200 Hz down to ~50 Hz, tau 25-45 ms). BODY drives the
+	// stage, the 3rd harmonic going from -36 dB clean to under -20 dB.
+	// PUNCH is the attack: a pulse and a breath of noise.
+	*bd1 { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var sweep = t[2], swt = t[3], punch = t[4], body = t[5], tone = t[6], lvl = t[7];
+		var vel = \vel.kr(1);
+		var top = freq * ((2 ** sweep) - 1) * (0.75 + (vel * 0.25));
+		var f = (freq + (top * Engine_VibeComposer.rc(swt))) * (1 + (g * 0.2));
+		var aenv = Engine_VibeComposer.rcenv(0.0012, dec);
+		var osc = Engine_VibeComposer.stage(SinOsc.ar(f), 0.4 + (body * 1.9), 0.01 + (body * 0.03));
+		var click = (HPF.ar(WhiteNoise.ar, 1200) * EnvGen.ar(Env.perc(0.0002, 0.0035)) * 2)
+			+ (HPF.ar(Decay2.ar(Impulse.ar(0), 0.0001, 0.0009), 800) * 3);
+		var sig = LPF.ar((osc * aenv) + (click * punch * vel), tone.clip(40, 18000));
+		^[LeakDC.ar(sig) * lvl, aenv, 0.002]
+	}
+
+	// BD2: the 808 side of the Tanzbar: a bridged-T pinged by the trigger.
+	// Hardly any sweep, a clean sine, a long tail, sharp while it is loud.
+	// CLICK is the accent pulse coming through, DRIVE the output stage
+	// leaning over, which is a 2nd harmonic first.
+	*bd2 { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var sweep = t[2], swt = t[3], click = t[4], drive = t[5], tone = t[6], lvl = t[7];
+		var vel = \vel.kr(1);
+		var aenv = Engine_VibeComposer.rcenv(0.0008, dec);
+		var zap = ((2 ** sweep) - 1) * Engine_VibeComposer.rc(swt) * (0.6 + (vel * 0.4));
+		var f = freq * (1 + zap) * (1 + (aenv.squared * 0.05 * vel)) * (1 + (g * 0.3));
+		var x = SinOsc.ar(f) * aenv;
+		var sig = Engine_VibeComposer.stage(x, 0.6 + (drive * 4), drive * 0.5);
+		var pulse = HPF.ar(LPF.ar(Decay2.ar(Impulse.ar(0), 0.0002, 0.0018), 4000), 700) * 4;
+		sig = LPF.ar(sig + (pulse * click * vel), tone.clip(40, 18000));
+		^[LeakDC.ar(sig) * lvl, aenv, 0.002]
+	}
+
+	// CLP: not three or four claps and a tail but a dense run of them: the
+	// samples hold 12-19 bursts about 4 ms apart, unevenly, falling ~16 dB
+	// across the run, then the tail. SPREAD is the spacing, GRAINS how many,
+	// SIZZLE fine crackle over the tail, WIDTH the band's rq.
+	*clp { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var sp = t[2].max(0.0015), cnt = t[3], sizz = t[4], rq = t[5], snap = t[6], lvl = t[7];
+		var an = \an.kr(0.5);
+		var run = sp * cnt;
+		var trig = Impulse.ar(sp.reciprocal * (1 + (LFNoise0.ar(sp.reciprocal) * (0.18 + (an * 0.25)))));
+		var open = Sweep.ar(Impulse.ar(0), 1) < (run - (sp * 0.5));
+		var bursts = Decay2.ar(trig * open, 0.0002, sp * 0.55)
+			* EnvGen.ar(Env([1, 0.16], [run.max(0.002)], \exp));
+		var tail = EnvGen.ar(Env([0, 0, 0.1, 0.0001, 0], [run * 0.85, sp * 2, dec, 0.005], [0, 0, \exp, 0]));
+		var n = WhiteNoise.ar;
+		var body = (BPF.ar(n, (freq * (1 + (g * 0.3))).clip(100, 16000), rq) * rq.reciprocal.sqrt * 1.6)
+			+ (HPF.ar(n, 5000) * 0.12);
+		var grains = Decay2.ar(Dust.ar(300 + (sizz * 3500)), 0.0002, 0.0015 + (sizz * 0.004));
+		var sizzle = BPF.ar(n, (freq * 2.3).clip(200, 15000), 0.25) * grains * sizz * 5;
+		var crack = HPF.ar(n, 3000) * EnvGen.ar(Env.perc(0.0002, 0.003)) * snap * 2;
+		var env = (bursts + tail).min(1);
+		var sig = (body * env) + (sizzle * tail) + crack;
+		^[sig * lvl, env, 0.001]
+	}
+
+	// SNR: two oscillators an octave apart (the samples: 1.97-2.0), RING
+	// the upper one, with a quick zap down at the strike. The wires are
+	// bright: a high-pass at W.TONE (falling away under 2 kHz),
+	// flat past 8 kHz with a peak near 11 kHz, and they outlast the shell.
+	*snr { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var snap = t[2], ndec = t[3] * decm, wtone = t[4], ring = t[5], crack = t[6], lvl = t[7];
+		var vel = \vel.kr(1), an = \an.kr(0.5);
+		var f = freq * (1 + (Engine_VibeComposer.rc(0.006) * 0.5 * (0.6 + (vel * 0.4)))) * (1 + (g * 0.25));
+		var aenv = Engine_VibeComposer.rcenv(0.0008, dec);
+		var renv = Engine_VibeComposer.rcenv(0.0008, dec * 0.8);
+		var nenv = Engine_VibeComposer.rcenv(0.001, ndec);
+		var n = WhiteNoise.ar;
+		var shell = (SinOsc.ar(f) * aenv)
+			+ (SinOsc.ar(f * 1.98 * (1 + (rrand(-0.008, 0.008) * an))) * renv * ring);
+		var wires = LPF.ar(HPF.ar(n, wtone.clip(200, 12000)) + (BPF.ar(n, 10900, 0.6) * 0.5), 18000) * 1.3;
+		var cr = HPF.ar(n, 2500) * EnvGen.ar(Env.perc(0.0002, 0.005)) * crack * 1.5;
+		var sig = ((shell * 1.2).tanh * 0.8) + (wires * nenv * snap) + cr;
+		^[sig * lvl * 0.8, aenv.max(nenv), 0.001]
+	}
+
+	// PRC1: the Tanzbar's small percussion on one MODE knob:
+	//   CLAVE    one resonance, PITCH x 2.5 (the samples: 1.1-1.5 kHz),
+	//            gone in 50 ms
+	//   RIM      two resonances DETUNE x 1.55 apart (the samples: 2.3),
+	//            clipped, with a click
+	//   COWBELL  the 808's: two square waves DETUNE apart (the samples:
+	//            exactly a fifth, 1.5), through a band around TONE
+	// In between, the two either side are crossfaded. STRIKE is the click.
+	*perc { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var mode = t[2], ratio = t[3], strike = t[4], tone = t[5], drive = t[6], lvl = t[7];
+		var an = \an.kr(0.5);
+		var f = freq * (1 + (g * 0.1));
+		var n = WhiteNoise.ar;
+		var exc = Engine_VibeComposer.strike(0.0004);
+		var clave = Ringz.ar(exc, (f * 2.5).clip(20, 16000), dec * 0.25) * 0.5;
+		var rim = ((Ringz.ar(exc, (f * 0.8).clip(20, 16000), dec * 0.22)
+			+ (Ringz.ar(exc, (f * 0.8 * ratio * 1.55).clip(20, 16000), dec * 0.15) * 0.6)) * 1.5).tanh;
+		var cenv = EnvGen.ar(Env([0, 1, 0.5, 0.001, 0], [0.0005, 0.01, dec, 0.005], [0, -3, \exp, 0]));
+		var cow = Pulse.ar(f, 0.5 + (rrand(-0.03, 0.03) * an))
+			+ Pulse.ar(f * ratio * (1 + (rrand(-0.004, 0.004) * an)), 0.5 + (rrand(-0.03, 0.03) * an));
+		var env = EnvGen.ar(Env.perc(0.0005, dec, 1, -4));
+		var k = 1 + (drive * 5);
+		var sig;
+		cow = HPF.ar(cow, (tone * 0.25).clip(80, 8000));
+		cow = LPF.ar(cow + (BPF.ar(cow, (tone * 1.6).clip(200, 16000), 0.8) * 2.5), (tone * 5).clip(1000, 20000))
+			* cenv * 0.3;
+		sig = SelectX.ar(mode.clip(0, 1) * 2, [clave, rim, cow]);
+		sig = (sig * k).tanh / k.tanh;
+		sig = LPF.ar(sig, (tone * 6).clip(1000, 20000))
+			+ (HPF.ar(n, 3000) * EnvGen.ar(Env.perc(0.0001, 0.002)) * strike * 0.8);
+		^[sig * lvl, env, 0.001]
+	}
+
+	// PRC2: the Tanzbar's toms and congas: an oscillator through a stage
+	// (2nd and 3rd harmonics 13-30 dB down in the samples), a little zap at
+	// the strike and then, after a moment, the slow BEND down by up to half
+	// over B.TIME (the samples: 125 Hz holding, then down to 98 by 150 ms).
+	// DRIVE is the stage, NOISE the conga's slap.
+	*tom { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var bend = t[2], btime = t[3], strike = t[4], drive = t[5], noise = t[6], lvl = t[7];
+		var vel = \vel.kr(1);
+		var glide = EnvGen.ar(Env([1, 1, 1 - (bend * 0.5)], [btime * 0.35, btime], [0, \sin]));
+		var f = freq * glide * (1 + (Engine_VibeComposer.rc(0.0025) * 1.5 * vel)) * (1 + (g * 0.15));
+		var aenv = Engine_VibeComposer.rcenv(0.001, dec);
+		var osc = Engine_VibeComposer.stage(SinOsc.ar(f), 0.6 + (drive * 2.6), drive * 0.7);
+		var n = WhiteNoise.ar;
+		var slap = BPF.ar(n, (f * 3).clip(100, 12000), 0.5) * EnvGen.ar(Env.perc(0.0005, 0.035)) * noise * 3;
+		var click = HPF.ar(n, 2500) * EnvGen.ar(Env.perc(0.0001, 0.003)) * strike * 1.5;
+		var sig = LeakDC.ar((osc * aenv) + slap + click);
+		^[sig * lvl, aenv, 0.001]
+	}
+
+	// HAT: FOLD walks clean (filtered noise) > metal (six square waves at
+	// SPREAD between harmonic and the 808's ratios) > dirty (wavefolded and
+	// decimated). CURVE runs the envelope from a tight choke to a round one.
+	// The Tanzbar's hats sit in a band: almost nothing under 4.5 kHz, a
+	// dense cluster around 7-8 kHz, so TONE is that band's centre and RES
+	// how hard it peaks.
+	*hat { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var fold = t[2], spread = t[3], tone = t[4], res = t[5], curve = t[6], lvl = t[7];
+		var i808 = [1, 1.483, 1.8, 2.546, 2.63, 3.897];
+		var harm = [1, 2, 3, 4, 5, 6];
+		var f = freq * (1 + (g * 0.1));
+		var metal = Mix.fill(6, { |k|
+			// six oscillators, none quite where it was set
+			Pulse.ar(f * (harm[k] + ((i808[k] - harm[k]) * spread))
+				* (1 + (rrand(-0.008, 0.008) * \an.kr(0.5))), 0.5 + (rrand(-0.04, 0.04) * \an.kr(0.5)))
+		}) / 6;
+		var a = (fold * 2).clip(0, 1);
+		var dirt = ((fold - 0.5) * 2).clip(0, 1);
+		var src = (WhiteNoise.ar * (1 - a)) + (metal * a * 1.6);
+		var env = EnvGen.ar(Env([0, 1, 0], [0.0005, dec], [1, curve.linlin(0, 1, -9, -2)]));
+		var sig;
+		src = (src * (1 + (dirt * 10))).fold2(1);
+		src = XFade2.ar(src, Latch.ar(src, Impulse.ar(SampleRate.ir * (0.5 - (dirt * 0.38)))),
+			(dirt * 2) - 1);
+		sig = RHPF.ar(RHPF.ar(src, (tone * 0.7).clip(500, 16000), 0.8), (tone * 0.7).clip(500, 16000), 0.8);
+		sig = sig + (BPF.ar(src, tone.clip(500, 18000), 0.3) * res * 3);
+		sig = LPF.ar(sig, (tone * 1.6).clip(2000, 20000));
+		^[sig * env * lvl * 5, env, 0.001]
+	}
+
+	// CYM: eight phase-modulated partials and air. DUST ages it: crackle,
+	// fewer bits, a lower rate, the top rolling away. SWELL slows the attack
+	// right down for a reversed-cymbal bloom.
+	*cym { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var dust = t[2], spread = t[3], tone = t[4], sizz = t[5], swell = t[6], lvl = t[7];
+		var base = [1, 1.48, 1.81, 2.29, 2.71, 3.17, 3.88, 4.41];
+		var f = freq * (1 + (g * 0.08));
+		var partials = Mix.fill(8, { |k|
+			var fk = f * (1 + ((base[k] - 1) * (0.6 + (spread * 0.8))))
+				* (1 + (rrand(-0.006, 0.006) * \an.kr(0.5)));
+			// free-running: every hit catches them at a different phase
+			var ph = Rand(0, 2pi) * (\an.kr(0.5) > 0.01);
+			SinOsc.ar(fk, (SinOsc.ar(fk * 1.41, ph * 1.3) * 2) + ph) + (Pulse.ar(fk * 0.5, 0.5) * 0.3)
+		}) / 8;
+		var n = WhiteNoise.ar;
+		var env = EnvGen.ar(Env([0, 1, 0], [swell, dec], [2, -4]));
+		var shimmer = BPF.ar(n, 9000, 0.4) * (0.6 + (LFNoise1.ar(40) * 0.4)) * sizz;
+		var src = (partials * 1.2) + (HPF.ar(n, 6000) * 0.25) + shimmer;
+		var sig, q, crackle;
+		sig = RHPF.ar(src, tone.clip(800, 16000), 0.7);
+		crackle = Decay2.ar(Dust.ar(20 + (dust * 400)), 0.0002, 0.003) * n * dust * 3;
+		q = 2 ** (16 - (dust * 11));
+		sig = XFade2.ar(sig,
+			(Latch.ar(sig, Impulse.ar(SampleRate.ir * (0.5 - (dust * 0.35)))) * q).round / q,
+			((dust * 2.5).clip(0, 1) * 2) - 1);
+		sig = LPF.ar(sig, 16000 - (dust * 9000)) + crackle;
+		^[sig * env * lvl * 0.8, env, swell]
+	}
+
+	// ------------------------------------------------------------ WOOD kit
+	//
+	// Wooden, organic percussion: a cajon, a tabla (bayan, tete, dayan), a
+	// wood block, a balafon, a shaker and a cymbal. What makes them wood
+	// rather than metal or skin:
+	//   damping   wood loses its high frequencies fast. Every mode here
+	//             dies sooner the higher it sits, by WOOD: 0 is green, damp
+	//             wood that only thocks, 1 dry hardwood (rosewood, a clave)
+	//             that rings
+	//   contact   what strikes it and how hard is how long it stays in
+	//             contact: a palm for several milliseconds, so only the low
+	//             modes move, a stick for a fraction of one, with a little
+	//             scrape of fibre in it
+	//   air       most of them are hollow, and the air inside rings too:
+	//             the cajon's port, the log's slot, the temple block, the
+	//             balafon's gourd
+	//   hands     nothing is struck the same way twice: every hit lands in
+	//             a slightly different place, so its modes come out in a
+	//             slightly different balance, by ANALOG
+	// The modes are summed one at a time so a voice stays well inside the
+	// server's 64 wire buffers.
+
+	// a rounded pulse of unit area: a mode low down rings at about 1
+	// whatever the contact time
+	*strike { arg w;
+		^Decay2.ar(Impulse.ar(0), w * 0.25, w) * (6.9 / (w * 0.75 * SampleRate.ir))
+	}
+
+	// HARD, 0-1: a palm at 0 (6 ms of contact), a hard stick at 1 (0.24 ms)
+	*knock { arg hard;
+		var c = 0.006 * (0.04 ** hard);
+		^Engine_VibeComposer.strike(c) + (WhiteNoise.ar * EnvGen.ar(Env.perc(0.0001, c)) * hard * 0.06)
+	}
+
+	// how fast the upper modes die against the fundamental, from WOOD
+	*damp { arg wood; ^2.5 * (0.12 ** wood) }
+
+	// modes at RATIOS of F, each AMPS loud, the fundamental ringing DEC and
+	// the rest shorter by DAMP. Each hit lands somewhere a little different.
+	*wmodes { arg exc, f, ratios, amps, dec, damp;
+		var an = \an.kr(0.5);
+		^ratios.size.collect({ |k|
+			var r = ratios[k];
+			var fk = (f * r * (1 + (rrand(-0.006, 0.006) * k.sign * an))).clip(20, 18000);
+			var dk = (dec / (1 + (damp * (r - 1)))).max(0.004);
+			var ak = amps[k] * (1 + (Rand(-0.35, 0.35) * an * k.sign)) * (fk < 17000);
+			[fk, dk, ak]
+		}).inject(0, { |sum, m| sum + (Ringz.ar(exc, m[0], m[1]) * m[2]) })
+	}
+
+	// BD1: a cajon's bass, a palm in the middle of the face. The face is a
+	// plywood plate, its modes dying fast; the box's air booms out of the
+	// port at PITCH, dropping a little as the face settles. HAND runs from
+	// a soft palm to firm fingers, BOX from all face to all port, FACE is
+	// the plate's pitch above the port, SLAP the wires inside catching it.
+	*cajon { arg t, pr, decm, g;
+		var freq = t[0] * pr * (1 + (g * 0.2)), dec = t[1] * decm;
+		var hand = t[2], box = t[3], face = t[4], slap = t[5], wood = t[6], lvl = t[7];
+		var exc = Engine_VibeComposer.knock(hand * 0.55);
+		var bend = EnvGen.kr(Env([1.07, 1], [0.035], -4));
+		var port = Ringz.ar(exc, freq * bend, dec);
+		var plate = Engine_VibeComposer.wmodes(exc, freq * (1.6 + (face * 2.4)),
+			[1, 1.59, 2.14, 2.65, 3.16], [1, 0.6, 0.5, 0.35, 0.25], dec * 0.3, Engine_VibeComposer.damp(wood));
+		var wires = HPF.ar(WhiteNoise.ar, 2500) * Amplitude.ar(plate, 0.0005, 0.03) * slap * 1.5;
+		var env = EnvGen.ar(Env.perc(0.001, dec, 1, -4));
+		var sig = (port * box * 1.1) + (plate * (1 - (box * 0.6)) * 0.6) + wires;
+		^[(sig * 1.2).tanh * lvl * 1.5, env, 0.002]
+	}
+
+	// The tabla. Its skins carry the syahi, a disc of paste that loads the
+	// middle of the skin until its modes fall into a harmonic series: that
+	// is why a tabla sings a note where any other drum thuds. The dayan
+	// (treble) is tuned and nearly harmonic, the bayan (bass) looser, and
+	// bent by the heel of the palm. A stroke is a fingertip flicked off the
+	// skin (open, it rings) or left on it (closed, it only taps).
+
+	// a stroke of contact C seconds at every impulse in HITS, unit area as
+	// *strike is
+	*strikes { arg hits, c; ^Decay2.ar(hits, c * 0.25, c) * (6.9 / (c * 0.75 * SampleRate.ir)) }
+
+	// BD2: the bayan. FINGER is how sharp the stroke, from the soft pad of
+	// the fingers to the tips. Then the heel of the palm presses into the
+	// skin and slides, so the note rises (the ghe's gamak): PRESS is how far,
+	// up to eight semitones, GLIDE how slowly. FLAT lays the whole palm on
+	// it: the ka, a dry slap that chokes the skin.
+	*bayan { arg t, pr, decm, g;
+		var freq = t[0] * pr * (1 + (g * 0.15)), dec = t[1] * decm;
+		var finger = t[2], press = t[3], glide = t[4], flat = t[5], wood = t[6], lvl = t[7];
+		var exc = Engine_VibeComposer.knock(finger * 0.6);
+		var bend = EnvGen.kr(Env([1.03, 1, (press * 8).midiratio], [0.012, 0.03 * (20 ** glide)], [-3, -2]));
+		var d = dec * (1 - (flat * 0.85));
+		var skin = Engine_VibeComposer.wmodes(exc, freq * bend, [1, 2, 2.92, 3.85, 4.9],
+			[1, 0.3, 0.16, 0.09, 0.05], d, Engine_VibeComposer.damp(wood));
+		var ka = ((LPF.ar(WhiteNoise.ar, 900) * EnvGen.ar(Env.perc(0.0005, 0.03)) * 0.6)
+			+ (Ringz.ar(exc, freq * 1.6, 0.03) * 0.3)) * flat;
+		var env = EnvGen.ar(Env.perc(0.001, d, 1, -4));
+		^[((skin + ka) * 1.2).tanh * lvl * 0.9, env, 0.002]
+	}
+
+	// CLP: tete, the quick closed strokes of a tabla roll (ti-ra-ki-ta):
+	// STROKES of them SPREAD apart, the fingers left on the dayan so it
+	// only taps at PITCH, every other one a ka on the bayan instead, by KA.
+	// THUD is the skin under the fingers against the note ringing through.
+	*tete { arg t, pr, decm, g;
+		var freq = t[0] * pr * (1 + (g * 0.15)), dec = t[1] * decm;
+		var sp = t[2].max(0.001), cnt = t[3], ka = t[4], thud = t[5], wood = t[6], lvl = t[7];
+		var t0 = Impulse.ar(0), an = \an.kr(0.5);
+		var trig = 6.collect({ |k|
+			TDelay.ar(t0, (sp * k * (1 + (Rand(-0.15, 0.15) * an * k.sign))).min(0.6)) * (cnt > k)
+				* (1 - (k * 0.07)) * (1 + (Rand(-0.2, 0.2) * an * k.sign))
+		});
+		var dh = trig.collect({ |tr, k| if(k.odd) { tr * (1 - ka) } { tr } }).inject(0, { |a, b| a + b });
+		var bh = trig.collect({ |tr, k| if(k.odd) { tr * ka } { 0 } }).inject(0, { |a, b| a + b });
+		var skin = Engine_VibeComposer.wmodes(Engine_VibeComposer.strikes(dh, 0.0007), freq, [1, 2, 3, 4, 5],
+			[0.5, 1, 0.6, 0.4, 0.25], dec, Engine_VibeComposer.damp(wood));
+		var tap = LPF.ar(WhiteNoise.ar, 2500) * Decay2.ar(dh, 0.0003, 0.01) * thud * 0.7;
+		var kas = LPF.ar(WhiteNoise.ar, 700) * Decay2.ar(bh, 0.0005, 0.025) * 1.2;
+		var env = Decay2.ar(dh + bh, 0.0005, dec.max(0.03)).min(1);
+		^[((skin * 1.1 * (1.15 - thud)) + (tap * 1.6) + (kas * 1.6)).tanh * lvl * 0.9, env, 0.001]
+	}
+
+	// SNR: the dayan. RIM is where the finger lands: in the middle (tun,
+	// the fundamental singing) out to the rim (na, the fundamental held
+	// down by the ring finger, the harmonics ringing). DAMP leaves the
+	// finger on (te: a tap, no ring). SYAHI is how harmonic the skin is,
+	// a plain drum at 0; FLICK how sharp the finger comes off it.
+	*dayan { arg t, pr, decm, g;
+		var freq = t[0] * pr * (1 + (g * 0.15)), dec = t[1] * decm;
+		var rim = t[2], dmp = t[3], syahi = t[4], flick = t[5], wood = t[6], lvl = t[7];
+		var exc = Engine_VibeComposer.knock(0.4 + (flick * 0.5));
+		var plain = [1, 1.59, 2.14, 2.3, 2.65, 2.92];
+		var ratios = 6.collect({ |k| ((k + 1) * syahi) + (plain[k] * (1 - syahi)) });
+		var amps = [[1, 0.55, 0.35, 0.22, 0.12, 0.07], [0.12, 1, 0.75, 0.55, 0.35, 0.2]]
+			.flop.collect({ |p| (p[0] * (1 - rim)) + (p[1] * rim) });
+		var d = dec * (1 - (dmp * 0.9));
+		var bend = EnvGen.kr(Env([1.015, 1], [0.02], -4));
+		var skin = Engine_VibeComposer.wmodes(exc, freq * bend, ratios, amps, d, Engine_VibeComposer.damp(wood));
+		var tap = LPF.ar(WhiteNoise.ar, 1800) * EnvGen.ar(Env.perc(0.0005, 0.015)) * dmp * 0.5;
+		var snap = HPF.ar(WhiteNoise.ar, 3000) * EnvGen.ar(Env.perc(0.0002, 0.003)) * flick * 0.3;
+		var env = EnvGen.ar(Env.perc(0.001, d, 1, -4));
+		^[((skin * 0.95) + tap + snap).tanh * lvl * 1.1, env, 0.001]
+	}
+
+	// mode tables: a solid block, a hollow temple block, a clave rod
+	*blocks { ^[
+		[1, 1.58, 2.73, 3.9, 5.1],
+		[1, 2.04, 3.3, 4.7, 6.3],
+		[1, 2.756, 5.404, 8.933, 13.34]
+	] }
+
+	// PRC1: a wood block. SHAPE walks solid block > temple block > clave;
+	// HOLLOW is the air inside ringing on and darkening the strike, a
+	// temple block's "tok"; STICK how hard; POS where it lands.
+	*woodblock { arg t, pr, decm, g;
+		var freq = t[0] * pr * (1 + (g * 0.15)), dec = t[1] * decm;
+		var hollow = t[2], stick = t[3], shape = t[4], pos = t[5], wood = t[6], lvl = t[7];
+		var idx = shape.clip(0, 1) * 2;
+		var lo = idx.floor.min(1), w = idx - lo;
+		var table = Engine_VibeComposer.blocks;
+		var exc = Engine_VibeComposer.knock(0.3 + (stick * 0.7));
+		var ratios = 5.collect { |k|
+			var r0 = Select.kr(lo, table.collect { |row| row[k] });
+			var r1 = Select.kr(lo + 1, table.collect { |row| row[k] });
+			r0 + ((r1 - r0) * w)
+		};
+		var amps = 5.collect { |k| sin(pi * (k + 1) * (0.05 + (pos * 0.45))).abs.max(0.1) / ((k + 1) ** 0.5) };
+		var body = Engine_VibeComposer.wmodes(exc, freq, ratios, amps, dec, Engine_VibeComposer.damp(wood));
+		var air = Ringz.ar(exc, freq * 1.01, dec * 2.5) * hollow * 0.6;
+		var env = EnvGen.ar(Env.perc(0.0005, dec * (1 + (hollow * 1.5)), 1, -4));
+		body = LPF.ar(body, (16000 * (0.25 ** hollow)).clip(1500, 18000));
+		^[((body * 0.7) + air).tanh * lvl * 1.3, env, 0.001]
+	}
+
+	// PRC2: a balafon key. TUNE walks a carved, tuned key (its overtones
+	// at 4x and 10x, as a marimba's are) to a plain bar of wood; GOURD is
+	// the gourd under it, holding the fundamental on; BUZZ is the gourd's
+	// mirliton, a skin over a hole that rattles once the air in the gourd
+	// moves hard enough, the balafon's own sound.
+	*balafon { arg t, pr, decm, g;
+		var freq = t[0] * pr * (1 + (g * 0.15)), dec = t[1] * decm;
+		var mallet = t[2], gourd = t[3], buzz = t[4], tune = t[5], wood = t[6], lvl = t[7];
+		var exc = Engine_VibeComposer.knock(0.2 + (mallet * 0.7));
+		var tuned = [1, 3.99, 9.2, 15.8], plain = [1, 2.756, 5.404, 8.933];
+		var ratios = 4.collect { |k| tuned[k] + ((plain[k] - tuned[k]) * tune) };
+		var bar = Engine_VibeComposer.wmodes(exc, freq, ratios, [1, 0.45, 0.25, 0.12], dec,
+			Engine_VibeComposer.damp(wood));
+		var air = Resonz.ar(bar, freq, 0.04) * 8 * gourd;
+		var lvlair = Amplitude.ar(air, 0.001, 0.04);
+		var rattle = (BPF.ar((air * 10).clip2(0.4), 1800, 1.2) * 2)
+			+ (BPF.ar(WhiteNoise.ar, 2400, 1) * (lvlair * 4).clip(0, 1) * 0.4);
+		var env = EnvGen.ar(Env.perc(0.001, dec * (1 + gourd), 1, -4));
+		^[((bar * 0.7) + (air * 0.5) + (rattle * buzz)).tanh * lvl * 0.7, env, 0.001]
+	}
+
+	// HAT: a shaker, seeds in a gourd, after Perry Cook's PhISEM. A seed
+	// hitting the wall is not a click but a little burst of noise, so every
+	// collision here is noise under its own short decay, as loud as the
+	// hit was hard. A shake throws the seeds over ATTACK, most of them land
+	// on the far wall together (the chick), and the stragglers rattle on
+	// over DECAY, as often as the energy left allows (BEANS is how many).
+	// GRAIN is the seeds: sand (fine, short, bright) to beans (fewer,
+	// longer, with body). The shell is three broad resonances at PITCH and
+	// SPREAD above it, SHELL how much it colours them: a plastic egg at 0,
+	// a gourd at 1. Broad, so the seeds never ping.
+	*shaker { arg t, pr, decm, g;
+		var freq = t[0] * pr * (1 + (g * 0.1)), dec = t[1] * decm;
+		var beans = t[2], shell = t[3], spread = t[4], atk = t[5], grain = t[6], lvl = t[7];
+		var env = EnvGen.ar(Env([0, 1, 0], [atk, dec], [2, -5]));
+		var chick = EnvGen.ar(Env([0, 0, 1, 0], [atk, 0.0005, 0.006 + (grain * 0.012)], [0, 0, -6]));
+		var rate = (60 * (40 ** beans)) * env;
+		var fine = Decay.ar(Dust.ar(rate), 0.00025 + (grain * 0.0004)) * WhiteNoise.ar;
+		var big = Decay.ar(Dust.ar(rate * grain * 0.3), 0.0008 + (grain * 0.0015)) * WhiteNoise.ar;
+		var hits = (HPF.ar(fine, 2500) * (1 - (grain * 0.4)))
+			+ (LPF.ar(big, freq * 1.5) * grain * 1.4)
+			+ (HPF.ar(WhiteNoise.ar, 1500) * chick * (0.25 + (beans * 0.35)));
+		var rq = 1.4 * (0.12 ** shell);
+		var body = [1, 1 + (spread * 0.6), 1 + (spread * 1.5)].collect({ |r, k|
+			BPF.ar(hits, (freq * r).clip(400, 16000), rq) * (1 - (k * 0.3))
+		}).inject(0, { |a, b| a + b }) * (rq.reciprocal.sqrt * 0.9);
+		var sig = (body * (0.35 + (shell * 0.65))) + (HPF.ar(hits, freq) * (1 - shell) * 0.7);
+		^[sig * lvl * 5, env, atk]
+	}
+
+	// an acoustic cymbal's modes, as multiples of its lowest: dense and
+	// inharmonic, spreading wider the higher they go
+	*cymratios { ^16.collect({ |k| 1 + (k * 0.62) + (0.09 * (k ** 1.75)) + (0.07 * sin(k * 2.3)) }) }
+
+	// CYM: an acoustic cymbal, struck. The stick puts noise into the
+	// plate's modes (PITCH is the lowest), which ring on over DECAY, the
+	// higher ones dying sooner, so it darkens as it goes. STICK is the
+	// stick: a soft mallet (slow, dark) to a hard tip. BELL rings the cup's
+	// few long partials (a ride's ping), WASH the haze of modes too dense to
+	// tell apart, TONE how bright the whole plate is. SWELL rolls it in.
+	*cymbal { arg t, pr, decm, g;
+		var freq = t[0] * pr * (1 + (g * 0.08)), dec = t[1] * decm;
+		var stick = t[2], bell = t[3], wash = t[4], tone = t[5], swell = t[6], lvl = t[7];
+		var env = EnvGen.ar(Env([0, 1, 0], [swell, dec], [2, -4]));
+		var hit = EnvGen.ar(Env([0, 1, 0], [swell.max(0.0005), 0.003 + ((1 - stick) * 0.02)], [2, -4]));
+		var exc = LPF.ar(WhiteNoise.ar * hit, 2500 + (stick * 9000));
+		var plate = Engine_VibeComposer.cymratios.collect({ |r, k|
+			[(freq * r).clip(20, 16000), dec * 1.3 / (1 + (k * 0.15)), 1 / (1 + (k * 0.08))]
+		}).inject(0, { |sum, m| sum + (Ringz.ar(exc, m[0], m[1]) * m[2]) }) * 0.012;
+		var cup = [2.37, 3.11, 4.53].collect({ |r, k|
+			Ringz.ar(exc, (freq * r * 2).clip(20, 16000), dec * 0.8) * (1 - (k * 0.25))
+		}).inject(0, { |a, b| a + b }) * bell * 0.01;
+		var haze = BPF.ar(WhiteNoise.ar, freq * 9, 1.2) * env * wash * 0.25;
+		var dark = EnvGen.ar(Env([1, 0.4], [dec], -2));
+		var sig = LPF.ar(plate + cup + haze, ((2200 + (tone * 9000)) * (0.6 + (stick * 0.4)) * dark).clip(800, 18000));
+		^[HPF.ar(sig, freq * 0.7) * lvl * 2, env, swell]
+	}
+
+	// -------------------------------------------------------------- FM kit
+	//
+	// After the Yamaha YMF262 (OPL3), the way ALM's Akemie's Taiko plays it
+	// as a drum: two- and four-operator FM from the chip's own parts.
+	//   operators  a 10-bit phase, reset at key-on as the chip does (so
+	//              every hit starts the same), through one of the OPL3's
+	//              eight waveforms: sine, half, abs, quarter, alternating,
+	//              camel, square, derived square. Nothing is band-limited
+	//              and the chip was not either: the high sidebands fold back
+	//   feedback   operator 1 feeds back on itself, sine to saw to noise,
+	//              as the chip's FB 0-7 does
+	//   RATIO      the chip's MULT: 1/2, 1-10, 12, 15
+	//   rhythm     the hat, snare and cymbal use the OPL's rhythm mode:
+	//              phase bits of two operators XORed into a metallic
+	//              square, the noise generator flipping it, read out
+	//              through the sine table at the chip's own phases
+	//   the DAC    a 10-bit mantissa and a 3-bit exponent (the YM3014
+	//              the chip feeds), so the grain rides the signal down
+	// Phase modulation is in cycles: FM all the way is two of them.
+
+	*oplwave { arg p, wave;
+		var s = (2pi * p).sin, s2 = (4pi * p).sin, first = p < 0.5;
+		var x = (p * 2).frac;
+		^Select.ar(wave.clip(0, 7).round, [
+			s,
+			s.max(0),
+			s.abs,
+			s.abs * (x < 0.5),
+			s2 * first,
+			s2.abs * first,
+			(first * 2) - 1,
+			Select.ar(first, [(2 ** ((1 - x) * -12)).neg, 2 ** (x * -12)])
+		])
+	}
+
+	*op { arg freq, pm = 0, wave = 0;
+		var p = Phasor.ar(0, freq * SampleDur.ir, 0, 1);
+		p = ((p + pm).wrap(0, 1) * 1024).floor / 1024;
+		^Engine_VibeComposer.oplwave(p, wave)
+	}
+
+	*mult { arg i;
+		^Select.kr(i.clip(0, 12).round, [0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15])
+	}
+
+	*dac { arg sig;
+		var e = sig.abs.max(1e-6).log2.floor.clip(-7, 0);
+		var q = 2 ** (e - 9);
+		^((sig / q).round * q).clip2(1)
+	}
+
+	// bit k of a 10-bit phase
+	*bit { arg p, k; ^(p * (2 ** (10 - k))).floor % 2 }
+
+	// the rhythm mode's metal: bits 2, 3 and 7 of the hat operator against
+	// bits 3 and 5 of the top cymbal's, 1 or 0
+	*metal { arg p1, p2;
+		var b = Engine_VibeComposer;
+		var r1 = (b.bit(p1, 2) - b.bit(p1, 7)).abs.max(b.bit(p1, 3));
+		^r1.max((b.bit(p2, 3) - b.bit(p2, 5)).abs)
+	}
+
+	*phase { arg f; ^Phasor.ar(0, f * SampleDur.ir, 0, 1) }
+
+	// BD1: two operators, a modulator with a little feedback into the
+	// carrier, SWEEPing down over S.TIME. The FM closes faster than the
+	// pitch falls, so the click is FM and the body a WAVE.
+	*fkick { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var sweep = t[2], swt = t[3], fm = t[4], ratio = Engine_VibeComposer.mult(t[5]), wave = t[6], lvl = t[7];
+		var penv = EnvGen.ar(Env([2 ** sweep, 1], [swt], -6));
+		var f = freq * penv * (1 + (g * 0.2));
+		var aenv = EnvGen.ar(Env([0, 1, 0], [0.0008, dec], [0, -5]));
+		var menv = EnvGen.ar(Env([1, 0], [(swt * 3) + 0.03], -4));
+		var mod = SinOscFB.ar(f * ratio, 0.35);
+		var car = Engine_VibeComposer.op(f, mod * fm.squared * 2 * menv, wave);
+		^[Engine_VibeComposer.dac(LeakDC.ar(car) * aenv) * lvl * 1.3, aenv, 0.002]
+	}
+
+	// BD2: four operators, the chip's FM-FM with one beside it: operator 1
+	// feeds back (FDBK) into 2 at RATIO, 2 into the carrier, and a plain
+	// sine under them all for the weight. Pushed into the chip's clip.
+	*fkick4 { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var sweep = t[2], swt = t[3], fm = t[4], fb = t[5], ratio = Engine_VibeComposer.mult(t[6]), lvl = t[7];
+		var penv = EnvGen.ar(Env([2 ** sweep, 1], [swt], -5));
+		var f = freq * penv * (1 + (g * 0.3));
+		var aenv = EnvGen.ar(Env([0, 1, 0], [0.0008, dec], [0, -4]));
+		var menv = EnvGen.ar(Env([1, 0], [(swt * 4) + 0.04], -3));
+		var o1 = SinOscFB.ar(f * ratio, fb * 1.5) * menv;
+		var o2 = Engine_VibeComposer.op(f * ratio, o1 * 0.8);
+		var o3 = Engine_VibeComposer.op(f, o2 * fm.squared * 2 * menv);
+		var o4 = Engine_VibeComposer.op(f);
+		var sig = (((o3 * 0.75) + (o4 * 0.5)) * aenv * 1.3).clip2(1);
+		^[Engine_VibeComposer.dac(LeakDC.ar(sig)) * lvl * 0.85, aenv, 0.002]
+	}
+
+	// CLP: the clap's bursts gating a carrier at TONE, modulated by an
+	// operator fed back almost to noise: FM is how far, from a buzz to a
+	// hiss with a pitch in it.
+	*fclap { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var sp = t[2].max(0.002), cnt = t[3], fm = t[4], ratio = Engine_VibeComposer.mult(t[5]), wave = t[6], lvl = t[7];
+		var t0 = Impulse.ar(0);
+		var bursts = Mix.fill(6, { |k|
+			Decay2.ar(TDelay.ar(t0, (sp * k * (1 + (Rand(-0.18, 0.18) * \an.kr(0.5) * k.sign))).min(0.2)),
+				0.0004, sp * 0.85) * ((cnt - 1) > k) * (1 - (k * 0.07))
+		});
+		var tail = Decay2.ar(TDelay.ar(t0, (sp * (cnt - 1)).min(0.2)), 0.001, dec);
+		var env = (bursts + tail).min(1);
+		var f = (freq * (1 + (g * 0.3))).clip(100, 12000);
+		var mod = SinOscFB.ar(f * ratio, 1.2 + (fm * 0.6));
+		var car = Engine_VibeComposer.op(f, mod * fm.squared * 3, wave);
+		var sig = HPF.ar(LeakDC.ar(car), 250) * env;
+		^[Engine_VibeComposer.dac(sig) * lvl * 0.8, env, 0.001]
+	}
+
+	// SNR: a two-operator body, and the rhythm mode's snare: bit 8 of the
+	// hat operator's phase, a square, with the noise generator knocking it
+	// about. SNAP is how much, N.DEC how long.
+	*fsnare { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var snap = t[2], ndec = t[3] * decm, fm = t[4], ratio = Engine_VibeComposer.mult(t[5]), wave = t[6], lvl = t[7];
+		var penv = EnvGen.ar(Env([1.5, 1], [0.015], -4));
+		var f = freq * penv * (1 + (g * 0.25));
+		var aenv = EnvGen.ar(Env([0, 1, 0], [0.0008, dec], [0, -5]));
+		var nenv = EnvGen.ar(Env([0, 1, 0], [0.0008, ndec], [0, -6]));
+		var mod = SinOscFB.ar(f * ratio, 0.5) * EnvGen.ar(Env([1, 0.2], [dec * 0.5], -3));
+		var body = LeakDC.ar(Engine_VibeComposer.op(f, mod * fm.squared * 2, wave));
+		var b8 = Engine_VibeComposer.bit(Engine_VibeComposer.phase(f * 2.79), 8);
+		var sd = LeakDC.ar(1 - b8 - (WhiteNoise.ar > 0));
+		var sig = (body * aenv) + (sd * nenv * snap * 0.6);
+		^[Engine_VibeComposer.dac(sig) * lvl, aenv.max(nenv), 0.001]
+	}
+
+	// PRC1: two operators as a tom or a bell: RATIO and FDBK set the
+	// colour, FM how much of it, M.DEC how fast it closes to the WAVE.
+	*ftom { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var fm = t[2], mdec = t[3], ratio = Engine_VibeComposer.mult(t[4]), fb = t[5], wave = t[6], lvl = t[7];
+		var f = freq * (1 + (g * 0.15));
+		var aenv = EnvGen.ar(Env([0, 1, 0], [0.0008, dec], [0, -5]));
+		var menv = EnvGen.ar(Env([0, 1, 0], [0.0005, mdec], [0, -4]));
+		var mod = SinOscFB.ar(f * ratio, fb * 1.5);
+		var car = Engine_VibeComposer.op(f, mod * fm.squared * 2 * menv, wave);
+		^[Engine_VibeComposer.dac(LeakDC.ar(car) * aenv) * lvl, aenv, 0.001]
+	}
+
+	// PRC2: the taiko: a two-operator drum that SWEEPs into its pitch,
+	// the FM closing fast over M.DEC, and the stick: a click of noise.
+	*ftaiko { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var fm = t[2], mdec = t[3], sweep = t[4], ratio = Engine_VibeComposer.mult(t[5]), wave = t[6], lvl = t[7];
+		var penv = EnvGen.ar(Env([2 ** sweep, 1], [0.03 + (dec * 0.2)], -4));
+		var f = freq * penv * (1 + (g * 0.15));
+		var aenv = EnvGen.ar(Env([0, 1, 0], [0.0008, dec], [0, -4]));
+		var menv = EnvGen.ar(Env([0, 1, 0], [0.0005, mdec], [0, -4]));
+		var mod = SinOscFB.ar(f * ratio, 0.6) * menv;
+		var car = LeakDC.ar(Engine_VibeComposer.op(f, mod * fm.squared * 2, wave));
+		var stick = HPF.ar(WhiteNoise.ar, 2000) * EnvGen.ar(Env.perc(0.0003, 0.006)) * 0.3;
+		^[Engine_VibeComposer.dac((car * aenv) + stick) * lvl, aenv, 0.001]
+	}
+
+	// HAT: the rhythm mode's hi-hat. The hat operator at PITCH, the top
+	// cymbal's at RATIO times it; their metal flipped by the noise
+	// generator (NOISE) and read out of the sine table at the chip's four
+	// phases, so it is lopsided. FM puts the metal into a carrier as
+	// phase, rougher still; TONE is a highpass.
+	*fhat { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var ratio = t[2], noise = t[3], fm = t[4], tone = t[5], curve = t[6], lvl = t[7];
+		var f1 = freq * (1 + (g * 0.1));
+		var r = Engine_VibeComposer.metal(Engine_VibeComposer.phase(f1), Engine_VibeComposer.phase(f1 * ratio));
+		var n = WhiteNoise.ar.abs < (noise * 0.5);
+		var hh = LeakDC.ar((1 - (r * 2)) * (0.316 + (0.641 * (1 - (r - n).abs))));
+		var env = EnvGen.ar(Env([0, 1, 0], [0.0005, dec], [1, curve.linlin(0, 1, -9, -2)]));
+		var car = Engine_VibeComposer.op(f1 * 6, hh * fm.squared * 2);
+		var sig = HPF.ar((hh * (1 - (fm * 0.5))) + (car * fm), tone.clip(500, 16000));
+		^[Engine_VibeComposer.dac(sig * env) * lvl * 2.2, env, 0.001]
+	}
+
+	// CYM: the rhythm mode's top cymbal: the same metal with no noise in
+	// it, a hard square, so it is harsher than the hat. NOISE is air laid
+	// over it, FM as on the hat, TREM the chip's 3.7 Hz tremolo.
+	*fcym { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var ratio = t[2], noise = t[3], fm = t[4], tone = t[5], trem = t[6], lvl = t[7];
+		var f1 = freq * (1 + (g * 0.08));
+		var r = Engine_VibeComposer.metal(Engine_VibeComposer.phase(f1), Engine_VibeComposer.phase(f1 * ratio));
+		var cy = LeakDC.ar(1 - (r * 2));
+		var car = Engine_VibeComposer.op(f1 * 3, cy * fm.squared * 2);
+		var env = EnvGen.ar(Env([0, 1, 0], [0.001, dec], [2, -4]));
+		var am = 1 - (trem * 0.42 * (SinOsc.kr(3.7) + 1) * 0.5);
+		var sig = (cy * (1 - (fm * 0.5))) + (car * fm) + (HPF.ar(WhiteNoise.ar, 6000) * noise * 0.5);
+		sig = HPF.ar(sig, tone.clip(500, 16000));
+		^[Engine_VibeComposer.dac(sig * env * am) * lvl * 0.8, env, 0.001]
+	}
+
+	// ------------------------------------------------------------- ADD kit
+	//
+	// Additive drums after Autechre, the Max and Nord Modular years: every
+	// voice is a handful of sine partials, each with its own frequency,
+	// level and decay, so the knobs reach inside the spectrum rather than
+	// filtering it from outside. What that gives, and what these voices
+	// lean on:
+	//   click     partials that all start at the top of a cosine add up to
+	//             an impulse: CLICK lines them up, from a hard digital edge
+	//             to a soft, random-phase onset
+	//   series    PARTS, STRETCH, RATIO and SPREAD move the partials off
+	//             the harmonic series, from a tone to a bell to metal
+	//   damping   each partial decays on its own clock: TILT is how loud
+	//             the top is, DAMP and SHINE whether it dies first or last
+	//   motion    partials that glide into tune (BD2), a peak that walks up
+	//             the harmonics (PRC2), sines rerolled at random (SNR, CLP),
+	//             and ratchets that speed up or slow down (CLP, HAT)
+	// Nothing here rolls lang-side random numbers: the per-partial offsets
+	// are fixed tables, so every unit is the same instrument.
+
+	// partials summed one at a time: a bank built as an array and mixed
+	// keeps every partial's wires alive at once, and scsynth has 64
+	*adds { arg n, fn;
+		^(0..(n - 1)).inject(0, { |acc, k| acc + fn.value(k) })
+	}
+
+	// a partial's starting phase: CLICK 1 is the top of a cosine, so a bank
+	// of them starts as an impulse; 0 is anywhere
+	*cphase { arg click;
+		^(pi / 2) + (Rand(-pi, pi) * (1 - click.clip(0, 1)))
+	}
+
+	// a ratchet: n triggers, gap apart, each quieter until the last is at
+	// FALL, the gaps a touch uneven by ANALOG
+	*stutter { arg n, gap, fall;
+		var g = gap.max(0.001), nn = n.round.max(1);
+		var trig = Impulse.ar(g.reciprocal * (1 + (LFNoise0.ar(g.reciprocal) * 0.1 * \an.kr(0.5))));
+		var open = Sweep.ar(Impulse.ar(0), 1) < ((nn - 0.5) * g);
+		^trig * open * EnvGen.ar(Env([1, fall.max(0.001)], [(nn * g).max(0.002)], \exp))
+	}
+
+	// BD1: a sine kick built up from harmonics. PARTS of them over a
+	// fundamental that drops SWEEP octaves in S.TIME, the upper ones dying
+	// first; TILT how loud they start. CLICK lines them up and adds a few
+	// high cosines a couple of milliseconds long: the edge of a cut.
+	*akick { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var sweep = t[2], swt = t[3], parts = t[4], tilt = t[5], click = t[6], lvl = t[7];
+		var penv = EnvGen.ar(Env([2 ** sweep, 1], [swt.max(0.001)], -6));
+		var f = freq * penv * (1 + (g * 0.2));
+		var pow = 4 - (tilt * 3);
+		var ph = Engine_VibeComposer.cphase(click);
+		var atk = 0.0001 + ((1 - click) * 0.002);
+		var body = Engine_VibeComposer.adds(8, { |k|
+			var n = k + 1;
+			var on = (parts - k).clip(0, 1);
+			var e = EnvGen.ar(Env([0, 1, 0.001, 0], [atk, dec / (n ** 1.3), 0.005], [0, \exp, 0]));
+			SinOsc.ar((f * n).clip(20, 20000), ph) * e * on * (n ** pow.neg)
+		});
+		var tick = Engine_VibeComposer.adds(4, { |k|
+			SinOsc.ar((freq * [23, 31, 41, 53][k]).clip(200, 18000), pi / 2)
+		}) * EnvGen.ar(Env([1, 0.001, 0], [0.003, 0.001], [\exp, 0])) * click * 0.12;
+		var env = EnvGen.ar(Env([0, 1, 0.001, 0], [atk, dec, 0.005], [0, \exp, 0]));
+		^[LeakDC.ar(((body * 1.5) + tick).softclip) * lvl, env, 0.002]
+	}
+
+	// BD2: a kick that melts into tune. Its partials start SPREAD off the
+	// harmonic series, each its own way, and glide onto it over MELT while
+	// the whole falls BEND octaves: a metallic dwoing that resolves to a
+	// note. PARTS and TILT as on BD1.
+	*melt { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var spread = t[2], melt = t[3], parts = t[4], tilt = t[5], bend = t[6], lvl = t[7];
+		var offs = [0.06, 0.37, -0.21, 0.53, -0.44, 0.29, 0.71, -0.33];
+		var menv = EnvGen.ar(Env([1, 0], [melt.max(0.002)], -4));
+		var penv = EnvGen.ar(Env([2 ** bend, 1], [(melt * 0.6).max(0.002)], -5));
+		var f = freq * penv * (1 + (g * 0.2));
+		var pow = 3 - (tilt * 2.4);
+		var body = Engine_VibeComposer.adds(8, { |k|
+			var n = k + 1;
+			var on = (parts - k).clip(0, 1);
+			var e = EnvGen.ar(Env([0, 1, 0.001, 0], [0.0004, dec / (n ** 0.9), 0.005], [0, \exp, 0]));
+			var fk = f * n * (1 + (spread * offs[k] * menv));
+			SinOsc.ar(fk.clip(20, 20000), pi / 2) * e * on * (n ** pow.neg)
+		});
+		var env = EnvGen.ar(Env([0, 1, 0.001, 0], [0.0004, dec, 0.005], [0, \exp, 0]));
+		^[LeakDC.ar((body * 1.5).softclip) * lvl, env, 0.002]
+	}
+
+	// CLP: a ratchet of sine clusters. BURSTS of eight sines, GAP apart and
+	// the gaps ACCELerating or slowing, scattered over WIDTH octaves around
+	// TONE; REROLL deals each burst a new chord, from the same one every
+	// time to a fresh one each. The last burst rings on for DECAY.
+	*cluster { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var cnt = t[2], gap = t[3], accel = t[4], width = t[5], reroll = t[6], lvl = t[7];
+		var t0 = Impulse.ar(0);
+		var at = 0, step = gap.max(0.002), last = cnt.round.clip(1, 8) - 1;
+		var trigs = 8.collect { |i|
+			var tr = TDelay.ar(t0, at.min(1)) * (last >= i);
+			at = at + step;
+			step = step * accel;
+			tr
+		};
+		var all = trigs.sum;
+		var tail = Decay2.ar(Select.ar(last, trigs), 0.0005, dec);
+		var bursts = Decay2.ar(all * TRand.ar(0.6, 1, all), 0.0003, gap.clip(0.004, 0.05) * 0.8);
+		var env = (bursts + tail).min(1);
+		var tab = [-1, 0.71, -0.43, 0.14, 0.86, -0.71, 0.43, -0.14];
+		var f = freq * (1 + (g * 0.3));
+		var sig = Engine_VibeComposer.adds(8, { |k|
+			var dev = (tab[k] + (TRand.ar(-1, 1, all) * reroll)) * width * 0.5;
+			SinOsc.ar((f * (2 ** dev)).clip(80, 16000), Engine_VibeComposer.cphase(0.5))
+		}) * 0.3;
+		^[LeakDC.ar(sig * env) * lvl, env, 0.001]
+	}
+
+	// SNR: a drum's modes and a spray of sines. The membrane is six modes
+	// at a drumhead's Bessel ratios, a little tense at first; the snares are
+	// ten sines around BAND, each jumping to a new pitch RATE times a
+	// second: slow, it bleeps and chirps; fast, it hisses. SNAP is how much
+	// spray, N.DEC how long, CLICK the edge of the stick.
+	*spectral { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var snap = t[2], ndec = t[3] * decm, rate = t[4], band = t[5], click = t[6], lvl = t[7];
+		var ratios = [1, 1.594, 2.136, 2.296, 2.653, 2.918];
+		var penv = EnvGen.ar(Env([1.25, 1], [0.02], -4));
+		var f = freq * penv * (1 + (g * 0.25));
+		var ph = Engine_VibeComposer.cphase(click);
+		var atk = 0.0001 + ((1 - click) * 0.0015);
+		var body = Engine_VibeComposer.adds(6, { |k|
+			var e = EnvGen.ar(Env([0, 1, 0.001, 0], [atk, dec / ((k + 1) ** 0.6), 0.005], [0, \exp, 0]));
+			SinOsc.ar((f * ratios[k]).clip(20, 18000), ph) * e * ((k + 1) ** -0.7)
+		});
+		var nenv = EnvGen.ar(Env([0, 1, 0.001, 0], [atk, ndec, 0.005], [0, \exp, 0]));
+		var spray = Engine_VibeComposer.adds(10, { |k|
+			var tr = Dust.ar(rate) + Impulse.ar(0);
+			SinOsc.ar((band * TExpRand.ar(0.5, 2, tr)).clip(200, 18000), ph)
+		}) * nenv * 0.22;
+		var env = EnvGen.ar(Env([0, 1, 0.001, 0], [atk, dec.max(ndec), 0.005], [0, \exp, 0]));
+		^[LeakDC.ar(((body * 0.8) + (spray * snap)).softclip) * lvl, env, 0.001]
+	}
+
+	// PRC1: a bell of evenly spaced partials. The first at PITCH, the rest
+	// RATIO apart (1 is the harmonic series; anything else is a frequency-
+	// shifted, inharmonic one), PARTS of them, TILT how loud the top is,
+	// DAMP whether it dies first (+) or rings on past the fundamental (-).
+	// BEND drops into the note.
+	*shifted { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var ratio = t[2], parts = t[3], tilt = t[4], damp = t[5], bend = t[6], lvl = t[7];
+		var penv = EnvGen.ar(Env([2 ** bend, 1], [0.03], -6));
+		var f = freq * penv * (1 + (g * 0.15));
+		var pow = 2 - (tilt * 2);
+		var body = Engine_VibeComposer.adds(8, { |k|
+			var n = k + 1;
+			var on = (parts - k).clip(0, 1);
+			var e = EnvGen.ar(Env([0, 1, 0.001, 0], [0.0002, (dec / (n ** (damp * 1.2))).clip(0.005, 8), 0.005], [0, \exp, 0]));
+			SinOsc.ar((f * (1 + (k * ratio))).clip(20, 18000), pi / 2) * e * on * (n ** pow.neg)
+		});
+		var env = EnvGen.ar(Env([0, 1, 0.001, 0], [0.0002, dec * (8 ** damp.neg.max(0)), 0.005], [0, \exp, 0]));
+		^[LeakDC.ar((body * 0.7).softclip) * lvl, env, 0.001]
+	}
+
+	// PRC2: a tom whose overtones are scanned. Ten harmonics, and a peak
+	// WIDTH harmonics wide that walks from FROM to TO in SPEED, so the
+	// sound vowels as it dies, the way a swept filter does but with nothing
+	// between the harmonics. ODD takes the even ones out, towards a square.
+	*scan { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var from = t[2], to = t[3], width = t[4], speed = t[5], odd = t[6], lvl = t[7];
+		var f = freq * (1 + (g * 0.15));
+		var c = EnvGen.kr(Env([from, to], [speed.max(0.005)], -2));
+		var aenv = EnvGen.ar(Env([0, 1, 0.001, 0], [0.0003, dec, 0.005], [0, \exp, 0]));
+		var body = Engine_VibeComposer.adds(10, { |k|
+			var n = k + 1;
+			var peak = (((n - c) / width.max(0.2)).squared * -0.5).exp;
+			var keep = if(n.even) { 1 - odd } { 1 };
+			SinOsc.ar((f * n).clip(20, 18000), pi / 2) * peak * keep
+		});
+		^[LeakDC.ar((body * aenv * 0.55).softclip) * lvl, aenv, 0.001]
+	}
+
+	// HAT: twenty-four sines in eight clusters of three, packed into the
+	// band an octave and a bit above PITCH. A handful of clean sines up
+	// there is a whistle, not a hat: what makes metal is density and
+	// partials that will not sit still. So each cluster is three sines
+	// beating against each other, and SPREAD both widens the band and
+	// jitters every sine's pitch at audio rate, smearing it into a sliver
+	// of noise: 0 a tight, ringing metal, 1 a wide hiss. PARTS is how many
+	// clusters, struck nearly in cosine phase so the hit is a tick. ROLL
+	// ratchets it, GAP apart; SHINE lets the top clusters ring past the
+	// bottom ones.
+	*sinehat { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var spread = t[2], parts = t[3], roll = t[4], gap = t[5], shine = t[6], lvl = t[7];
+		var ratios = [1, 1.17, 1.31, 1.48, 1.63, 1.82, 2.03, 2.29];
+		var det = [[-0.021, 0.004, 0.027], [-0.033, 0.009, 0.019], [-0.014, 0.002, 0.038],
+			[-0.029, -0.006, 0.023], [-0.017, 0.011, 0.031], [-0.036, 0.003, 0.015],
+			[-0.024, 0.007, 0.034], [-0.012, -0.003, 0.026]];
+		var train = Engine_VibeComposer.stutter(roll, gap, 0.4);
+		var f = freq * (1 + (g * 0.1));
+		var wide = 0.55 + (spread * 0.9), dsc = 0.5 + (spread * 1.5);
+		var jit = spread.squared * 0.07, jrate = 2500 + (spread * 6000);
+		var sig = Engine_VibeComposer.adds(8, { |k|
+			var on = (parts - k).clip(0, 1);
+			var dk = (dec * ((k + 1) ** ((shine - 0.5) * 1.4))).clip(0.002, 6);
+			var fc = f * (ratios[k] ** wide);
+			var trio = Engine_VibeComposer.adds(3, { |j|
+				var fk = fc * (1 + (det[k][j] * dsc)) * (1 + (LFNoise1.ar(jrate) * jit));
+				SinOsc.ar(fk.clip(500, 19000), Engine_VibeComposer.cphase(0.75))
+			});
+			trio * Decay2.ar(train, 0.00005, dk) * on
+		});
+		var hold = (roll.round.max(1) - 1) * gap;
+		var env = EnvGen.ar(Env([0, 1, 1, 0.001, 0], [0.0005, hold, dec * 1.5, 0.005], [0, 0, \exp, 0]));
+		sig = sig * 0.75 / (parts.max(1) * 3).sqrt;
+		^[LeakDC.ar(sig.softclip) * lvl, env, 0.002 + hold]
+	}
+
+	// CYM: a wash of twelve partials on a STRETCHed series (1 is
+	// harmonic, 2 a bell, between them gongs and glass), each decaying on
+	// its own time, SCATTERed around DECAY, and beating against itself as
+	// SHIMMER wobbles each one's pitch and level. TILT is how bright, SWELL
+	// fades it in.
+	*wash { arg t, pr, decm, g;
+		var freq = t[0] * pr, dec = t[1] * decm;
+		var stretch = t[2], scatter = t[3], shim = t[4], tilt = t[5], swell = t[6], lvl = t[7];
+		var dtab = [1, 0.45, 0.8, 0.3, 1.3, 0.6, 0.95, 0.35, 1.15, 0.5, 0.7, 0.4];
+		var f = freq * (1 + (g * 0.08));
+		var pow = 1.6 - (tilt * 1.6);
+		var sig = Engine_VibeComposer.adds(12, { |k|
+			var n = k + 1;
+			var dk = dec * (1 + ((dtab[k] - 0.7) * scatter * 2)).max(0.1);
+			var e = EnvGen.ar(Env([0, 1, 0.001, 0], [swell, dk, 0.005], [2, \exp, 0]));
+			var wob = LFNoise2.kr(0.5 + (shim * 9));
+			var fk = f * (n ** stretch) * (1 + (wob * shim * 0.006));
+			SinOsc.ar(fk.clip(20, 19000), Engine_VibeComposer.cphase(0)) * e * (n ** pow.neg)
+				* (1 - (shim * 0.5 * (wob + 1) * 0.5))
+		});
+		var env = EnvGen.ar(Env([0, 1, 0.001, 0], [swell, dec * 1.5, 0.005], [2, \exp, 0]));
+		^[LeakDC.ar((sig * 0.45).softclip) * lvl, env, swell]
+	}
+
+	// --------------------------------------------------------------- SYNTH
+	//
+	// The melodic tracks' voice: a morphing wavetable oscillator, after the
+	// Synthesis Technology E350 Morphing Terrarium, through a lowpass.
+	//   TABLES     lib/wavetables/vc_wavetables.wav (lib/tools/build-
+	//              wavetables.py): 8 BANKS of 32 frames, each frame one
+	//              1024-sample cycle and its first sample again as a guard,
+	//              so a linear read never crosses into the next frame. In a
+	//              bank every frame keeps the same harmonic phases and the
+	//              same RMS, so a plain crossfade between two neighbouring
+	//              frames IS a smooth spectral morph: nothing cancels, the
+	//              level never dips. Six copies of it all, band-limited to
+	//              256, 128 ... 8 harmonics; a note reads the richest copy
+	//              that stays under 22 kHz (picked at note-on, see synLevel),
+	//              so nothing aliases. Loaded at alloc into 48 consecutive
+	//              buffers, one per (level, bank).
+	//   BANK WAVE  which bank, and where in it (0-1 across the 32 frames).
+	//              The position is slewed at audio rate (15 ms), so a knob,
+	//              FG2 or the LFO moving it never steps or zippers
+	//   SUB        a sine an octave down
+	//   CUT RES    a lowpass (RBJ, accurate up to Nyquist), FG2 moving it
+	//              by F2K (up to 5 octaves either way), softer notes a
+	//              little darker; RES runs Q from flat to 5. Above 16 kHz
+	//              the cutoff is stretched so the top of the knob is open:
+	//              at 18 kHz and RES 0 it is gone (-0.04 dB at 18 kHz)
+	//   FG1        a function generator on the AMP: RISE, FALL, CURVE and a
+	//              MODE: AD (rise and fall, the gate ignored), ASR (hold
+	//              while gated) or CYCLE (rise and fall over and over while
+	//              gated, the fall finishing on release). One SynthDef per
+	//              mode (vc_wt_ad, vc_wt_asr, vc_wt_cyc), picked at note-on,
+	//              so a voice runs one audio-rate envelope, not three: F1M
+	//              changes the next notes, not the sounding ones
+	//   FG2        the same, at control rate, onto WAVE (F2W, -1..1) and the
+	//              cutoff (F2K); its mode can change under a held note
+	//   LFO        the track's LFO (a control bus) by LFD onto PITCH (up to
+	//              an octave either way), WAVE (+-LFD), CUTOFF (+-4 octaves)
+	//              or AMP (tremolo)
+	// Lua owns every range and sends physical units. A voice is one note:
+	// it frees itself when FG1 is done, or 12 ms after ALIVE goes to 0
+	// (stolen, or a panic). NOTE glides over GLIDE seconds when it is set,
+	// which is all mono legato is. ANALOG here is the strip's drift (read
+	// from its drift bus) and a few cents of tuning per note.
+
+	// x is k, near enough, as a 1 or 0 (== on a UGen is identity, not a test)
+	*is { arg x, k; ^((x - k).abs < 0.5) }
+
+	// a function generator's Env in MODE 0 AD, 1 ASR, 2 CYCLE. CURVE is
+	// exponential, +c on the rise and -c on the fall, 0 straight. CYCLE:
+	// node 2 is the release node and 0 the loop, so held it goes round
+	// rise-fall, and let go it falls from wherever it is over FALL.
+	*fgEnv { arg mode, rise, fall, curve;
+		var r = rise.max(0.0005), f = fall.max(0.001), c = curve;
+		^[
+			Env([0, 1, 0], [r, f], [c, c.neg]),
+			Env([0, 1, 0], [r, f], [c, c.neg], 1),
+			Env([0, 1, 0, 0], [r, f, f], [c, c.neg, c.neg], 2, 0)
+		][mode]
+	}
+
+	*wtDefs { ^[\vc_wt_ad, \vc_wt_asr, \vc_wt_cyc] }
+
+	// the table level for a note: the most harmonics (256 at level 0 down
+	// to 8 at level 5) whose top one stays under 22 kHz
+	*synLevel { arg freq;
+		^(freq * 256 / 22000).log2.ceil.clip(0, 5).asInteger
+	}
+
+	*buildSynth {
+		// ---- WAVETABLE: one synth per note, mono out to its track's bus,
+		// one SynthDef per FG1 mode ----
+		Engine_VibeComposer.wtDefs.do { |name, mode|
+			Engine_VibeComposer.keep(SynthDef(name, {
+				// an EnvGen only releases on a gate that FALLS: one that is
+				// already 0 when it starts (a note-off or a steal in the same
+				// block as the note-on, i.e. a zero-length note) would hold
+				// for ever. So both gates read 1 for the first block.
+				var first = Impulse.kr(0);
+				var out = \out.kr(0), gate = \gate.kr(1).max(first), vel = \vel.kr(1), an = \an.kr(0.5);
+				var lft = \lft.kr(0).round, lfd = \lfd.kr(0);
+				var lfo = In.kr(\lfo.kr(0));
+				var b = Engine_VibeComposer;
+				var f2m = \f2m.kr(0).round.clip(0, 2);
+				var semi, freq, fg1, fg2, pos, ia, ib, t, buf, ph, xa, xb, sig, oct, fc, amp;
+				// the kill switch: control rate (one audio-rate envelope a
+				// voice is FG1's), K2A ramping it smoothly across each block.
+				// It starts at 1, so it never eats the front of an attack.
+				var alive = K2A.ar(EnvGen.kr(Env([1, 1, 0], [0, 0.012], \lin, 1), \alive.kr(1).max(first), doneAction: 2));
+
+				// PITCH: the note (gliding), FINE in cents, the strip's drift
+				// and a few cents of this note's own, both by ANALOG, the LFO
+				semi = Lag.kr(\note.kr(60), \glide.kr(0)) + (\fine.kr(0) * 0.01)
+					+ ((In.kr(\drift.kr(0)) + (Rand(-1, 1) * 0.04)) * an)
+					+ (lfo * lfd.squared * 12 * b.is(lft, 0));
+				freq = semi.midicps;
+
+				// FG1, this def's mode only, frees the voice when it is done.
+				// FG2 at control rate: its three modes are cheap there
+				fg1 = EnvGen.ar(b.fgEnv(mode, \f1r.kr(0.003), \f1f.kr(0.6), \f1c.kr(4)),
+					if(mode == 0) { 1 } { gate }, doneAction: 2);
+				fg2 = Select.kr(f2m, 3.collect { |m|
+					EnvGen.kr(b.fgEnv(m, \f2r.kr(0.001), \f2f.kr(0.4), \f2c.kr(4)), if(m == 0) { 1 } { gate })
+				});
+
+				// WAVE: a position across the bank's 32 frames, slewed at
+				// audio rate, and the two frames either side of it read at
+				// the same phase and crossfaded
+				pos = (\wave.kr(0) + (fg2 * \f2w.kr(0)) + (lfo * lfd * b.is(lft, 1))).clip(0, 1) * 31;
+				pos = Lag.ar(K2A.ar(pos), 0.015);
+				ia = pos.floor;
+				ib = (ia + 1).min(31);
+				t = pos - ia;
+				buf = \tbase.ir(0) + (\lvl.ir(0) * 8) + \bank.kr(0).round.clip(0, 7);
+				ph = Phasor.ar(0, freq * 1024 * SampleDur.ir, 0, 1024);
+				xa = BufRd.ar(1, buf, (ia * 1025) + ph, 0, 2);
+				xb = BufRd.ar(1, buf, (ib * 1025) + ph, 0, 2);
+				sig = xa + ((xb - xa) * t);
+				// SUB: a sine an octave down, at the tables' own RMS at 1
+				sig = sig + (SinOsc.ar(freq * 0.5) * \sub.kr(0) * 0.41);
+
+				// FILTER: octaves of FG2, the LFO and velocity on CUT, the
+				// top stretched open (see above)
+				oct = (fg2 * \f2k.kr(0) * 5) + (lfo * lfd * 4 * b.is(lft, 2)) + ((vel - 1) * 0.7);
+				fc = \cut.kr(18000) * (2 ** oct);
+				fc = (fc * (1 + (((fc - 16000) / 2000).clip(0, 1) * 0.25))).clip(20, 22000);
+				sig = BLowPass.ar(sig, fc, 1.414 - (\res.kr(0).clip(0, 1) * 1.214));
+
+				// AMP: FG1, velocity, the tremolo. Every frame sits at an RMS
+				// of 0.29 (manifest rms_gain), peaks up to 3.2 times that: at
+				// 0.45 a note is -18 dBFS RMS, peaking between -13 and -8
+				amp = fg1 * (vel ** 1.4) * 0.45 * (1 - (lfd * b.is(lft, 3) * (1 - lfo) * 0.5));
+				sig = sig * amp * alive;
+				sig = Select.ar(CheckBadValues.ar(sig, 0, 0) > 0, [sig, DC.ar(0)]);
+				Out.ar(out, sig);
+			}));
+		};
+
+		// ---- LFO: one per synth track, always running ----
+		// bipolar, -1..1, onto a control bus the track's voices read.
+		// SHAPE: 0 SINE 1 TRI 2 SAW 3 RAMP (down) 4 SQUARE 5 S+H
+		Engine_VibeComposer.keep(SynthDef(\vc_lfo, { |out = 0, rate = 1, shape = 0|
+			var r = rate.max(0.001);
+			Out.kr(out, Select.kr(shape.round.clip(0, 5), [
+				SinOsc.kr(r), LFTri.kr(r), LFSaw.kr(r), LFSaw.kr(r).neg,
+				LFPulse.kr(r) * 2 - 1, LFNoise0.kr(r)
+			]));
+		}));
+	}
+
+	// ------------------------------------------------------------- wrapper
+
+	// LEAN leaves out the noise layer and the sample layer. A SynthDef
+	// runs every UGen in it whether it is heard or not, and those two cost
+	// a voice 20-55% more with both at zero, which is how most tracks
+	// are. trig picks the lean one whenever it would sound the same.
+	*build { arg name, body, lean = false;
+		Engine_VibeComposer.keep(SynthDef(name, {
+			var out = \out.kr(0), vel = \vel.kr(1), gate = \gate.kr(1);
+			var pitch = \pitch.kr(0), decm = \decm.kr(1), smix = \smix.kr(0);
+			var t = [\t1a, \t1b, \t2a, \t2b, \t3a, \t3b, \t4a, \t4b].collect { |k| k.kr(0.5) };
+			var nz = if(lean) { 0 } { Engine_VibeComposer.noise(\ntype.kr(1), \ntone.kr(3000)) };
+			var nlvl = if(lean) { 0 } { \nlvl.kr(0) }, ngrain = if(lean) { 0 } { \ngrain.kr(0) };
+			var slvl = if(lean) { 0 } { \slvl.kr(0) };
+			var satk = \satk.kr(0.0005), sdec = \sdec.kr(0.6);
+			// ANALOG: this hit's pitch (semitones), decay, level and
+			// brightness, the strip's drift, and this unit's own tuning
+			var an = \an.kr(0.5);
+			var semi = (Rand(-1, 1) * 0.07) + In.kr(\drift.kr(60)) + rrand(-0.12, 0.12);
+			var hdec = 1 + (Rand(-1, 1) * 0.12 * an);
+			var hamp = 1 + (Rand(-1, 1) * 0.1 * an);
+			var res = body.value(t, (pitch + (semi * an)).midiratio, decm * hdec, nz * ngrain);
+			var syn = res[0], env = res[1], atk = res[2];
+			var vk, vb, bright;
+			var smp = if(lean) { 0 } { Engine_VibeComposer.sampler(\buf.kr(0), \sstart.kr(0), sdec * decm,
+				pitch + \spitch.kr(0), \stone.kr(0), satk, \srev.kr(0)) * slvl };
+			// MIX: -1 is synth alone, +1 the sample alone, 0 both at full
+			var sg = (1 - smix).clip(0, 1), mg = (1 + smix).clip(0, 1);
+			var sig = (((syn + (nz * env * nlvl)) * sg) + (smp * mg)) * (vel ** 1.4) * hamp;
+			var hold = atk + satk + 0.08;
+			// the VCA: a biased tanh, unity slope at rest, so quiet hits pass
+			// clean and loud ones round over, one half sooner than the other
+			vk = 0.2 + (an * 1.1);
+			vb = an * 0.14;
+			sig = LeakDC.ar((((sig * vk) + vb).tanh - vb.tanh) / (vk * (1 - vb.tanh.squared)), 0.9995);
+			// softer hits are darker, and no two are quite as bright
+			bright = (20000 * ((0.4 + (vel * 0.6)) ** (an * 1.6)) * (1 + (Rand(-1, 1) * 0.15 * an)));
+			sig = LPF.ar(sig, bright.clip(3000, 20000));
+			// audio rate: a control-rate gate ramps up across the first block
+			// (64 samples, 1.3 ms), which ate the front of every attack
+			sig = sig * EnvGen.ar(Env.asr(0, 1, 0.012), gate, doneAction: 2);
+			// a bad sample (NaN, inf, denormal) goes out as silence: one that
+			// got into a strip would wedge its filters and, through the
+			// returns and COLOUR, mute everything until a restart. It also
+			// lets the silence detector free a voice that went bad.
+			sig = Select.ar(CheckBadValues.ar(sig, 0, 0) > 0, [sig, DC.ar(0)]);
+			DetectSilence.ar(sig.abs.max(Line.ar(1, 0, hold)), 0.0002, 0.12, doneAction: 2);
+			Out.ar(out, sig);
+		}));
+	}
+
+	// a voice's lean twin (see *build)
+	*leanName { arg name; ^(name ++ "_lean").asSymbol }
+
+	// Every voice, full or lean. Both passes roll the same parts in the
+	// same order, so a lean voice is exactly its full twin's instrument.
+	*buildVoices { arg lean = false;
+		var b = { |name, body|
+			Engine_VibeComposer.build(if(lean) { Engine_VibeComposer.leanName(name) } { name }, body, lean) };
+		// the parts this unit was built from: the same every boot
+		thisThread.randSeed = 808;
+		b.(\vc_bd1, { |t, pr, d, g| Engine_VibeComposer.bd1(t, pr, d, g) });
+		b.(\vc_bd2, { |t, pr, d, g| Engine_VibeComposer.bd2(t, pr, d, g) });
+		b.(\vc_clp, { |t, pr, d, g| Engine_VibeComposer.clp(t, pr, d, g) });
+		b.(\vc_snr, { |t, pr, d, g| Engine_VibeComposer.snr(t, pr, d, g) });
+		b.(\vc_prc1, { |t, pr, d, g| Engine_VibeComposer.perc(t, pr, d, g) });
+		b.(\vc_prc2, { |t, pr, d, g| Engine_VibeComposer.tom(t, pr, d, g) });
+		// the old voices up to here rolled 12 parts; roll the seed back to
+		// where they left it, so the hat, the cymbal and the WOOD and FM kits
+		// keep exactly the parts they were built from before
+		thisThread.randSeed = 808;
+		12.do { rrand(-1.0, 1.0) };
+		b.(\vc_hat, { |t, pr, d, g| Engine_VibeComposer.hat(t, pr, d, g) });
+		b.(\vc_cym, { |t, pr, d, g| Engine_VibeComposer.cym(t, pr, d, g) });
+
+		// WOOD and FM after WARM, so WARM's parts roll the same as before
+		[
+			[\vc_wbd1, \cajon], [\vc_wbd2, \bayan], [\vc_wclp, \tete], [\vc_wsnr, \dayan],
+			[\vc_wprc1, \woodblock], [\vc_wprc2, \balafon], [\vc_what, \shaker], [\vc_wcym, \cymbal],
+			[\vc_fbd1, \fkick], [\vc_fbd2, \fkick4], [\vc_fclp, \fclap], [\vc_fsnr, \fsnare],
+			[\vc_fprc1, \ftom], [\vc_fprc2, \ftaiko], [\vc_fhat, \fhat], [\vc_fcym, \fcym],
+			[\vc_abd1, \akick], [\vc_abd2, \melt], [\vc_aclp, \cluster], [\vc_asnr, \spectral],
+			[\vc_aprc1, \shifted], [\vc_aprc2, \scan], [\vc_ahat, \sinehat], [\vc_acym, \wash]
+		].do { |e|
+			b.(e[0], { |t, pr, d, g| Engine_VibeComposer.perform(e[1], t, pr, d, g) });
+		};
+	}
+
+	// every SynthDef, as it is built, for buildDefs to hand back
+	*keep { arg def; built.add(def) }
+
+	// Build every SynthDef and return them, added (to SynthDescLib and any
+	// running server) unless ADD is false. Adding one reads it back into a
+	// SynthDesc and sends it, which is most of the time it takes: loadDefs
+	// does neither.
+	*buildDefs { arg add = true;
+		var all;
+		built = List.new;
+		Engine_VibeComposer.buildVoices(false);
+		Engine_VibeComposer.buildVoices(true);
+		Engine_VibeComposer.buildSynth;
+
+		// ---- HISS: every strip's VCA hiss, one channel each ----
+		// Mostly white with the extremes rolled off, about -80 dB at the
+		// default. It is made here rather than in the strips so that it
+		// can sleep while the sequencer is stopped and lua sends 0, which
+		// takes a third of what the eight strips cost.
+		Engine_VibeComposer.keep(SynthDef(\vc_hiss, { |out = 0, hiss = 0.35|
+			var hs = 8.collect { LPF.ar(HPF.ar(WhiteNoise.ar + (PinkNoise.ar * 0.6), 250), 13000) };
+			Out.ar(out, hs * Lag.kr(hiss, 0.1).squared * 0.0011);
+		}));
+
+		// ---- STRIP: one per track, always running ----
+		// idx is the track, 1-8; sc is where it writes its envelope for the
+		// sidechain, duck where it reads the DUCK's reduction back, hbus its
+		// channel of the HISS
+		Engine_VibeComposer.keep(SynthDef(\vc_strip, { |in = 0, out = 0, meter = 0, dbus = 0, sbus = 0, idx = 0, sc = 0, duck = 0,
+			drift = 60, level = 0.8, pan = 0, tilt = 0, drive = 0, warmth = 0.3, dsend = 0, ssend = 0,
+			mute = 0, pmute = 0, hbus = 0|
+			var lagt = 0.05;
+			var sig = In.ar(in, 1);
+			var dr = Lag.kr(drive, lagt), wm = Lag.kr(warmth, lagt), tl = Lag.kr(tilt, lagt);
+			var dgain, dx, dy, mk, amp, st, dk, mt;
+			// the voices already guard their own output; this catches anything
+			// else on the bus before it can wedge the filters below
+			sig = Select.ar(CheckBadValues.ar(sig, 0, 0) > 0, [sig, DC.ar(0)]);
+
+			// DRIFT, for this track's voices to read, in semitones: a slow
+			// wander like a circuit warming and cooling, a little faster
+			// flutter on top. The voices scale it by ANALOG.
+			Out.kr(drift, (LFNoise2.kr(0.04 + (idx * 0.006)) * 0.22)
+				+ (LFNoise1.kr(0.7 + (idx * 0.05)) * 0.025));
+
+			// WARMTH: a broad low lift and the top rounded off
+			sig = BLowShelf.ar(sig, 140, 1, wm * 5);
+			sig = LPF.ar(sig, (18000 * (0.25 ** wm)).clip(2000, 20000));
+
+			// DRIVE: Pappus' asymmetric fuzz and its fitted makeup, so the
+			// knob changes character rather than level
+			dgain = 1 + (dr.squared * 40);
+			dx = sig * dgain;
+			dy = dx / (1 + (dx.abs * (1 + (dr * 6 * (sig < 0)))));
+			dy = LeakDC.ar(dy);
+			mk = 1.00658 + (dr * -2.84907) + (dr.squared * 3.75126) + ((dr ** 3) * -1.62992);
+			sig = XFade2.ar(sig, dy * mk, ((dr * 4).clip(0, 1) * 2) - 1);
+
+			// TILT: one knob leaning the spectrum around 700 Hz
+			sig = BLowShelf.ar(sig, 700, 0.6, tl * -9);
+			sig = BHiShelf.ar(sig, 700, 0.6, tl * 9);
+
+			// the sidechain hears the track before its fader and after its
+			// mute: the level does not change how hard it ducks, a mute stops it.
+			// PMUTE is the PERFORM page's DROP, a mute of its own so it never
+			// touches the one you set
+			mt = Lag.kr((1 - mute) * (1 - pmute), 0.01);
+			Out.kr(sc, Amplitude.kr(sig * mt, 0.001, 0.02));
+			dk = In.kr(duck, 3);
+			amp = Lag.kr(level.squared * 1.5, 0.02) * mt * (1 - (dk[0] * ((dk[2] - idx).abs > 0.5)));
+			// VCA HISS: under the fader, so it rides the level, the duck and
+			// the mute. Asleep, nothing writes the bus and it reads silence.
+			sig = sig + In.ar(hbus);
+			sig = sig * amp;
+			Out.kr(meter, Amplitude.kr(sig, 0.005, 0.25));
+			st = Pan2.ar(sig, Lag.kr(pan, lagt));
+			Out.ar(out, st);
+
+			// SENDS: after the fader, the pan and the mute, so a muted track's
+			// tail rings out in the space rather than stopping dead. Squared,
+			// so the bottom half of the knob is the fine end.
+			Out.ar(dbus, st * Lag.kr(dsend, lagt).squared);
+			Out.ar(sbus, st * Lag.kr(ssend, lagt).squared);
+		}));
+
+		// ---- DELAY: shared by every track ----
+		// a tape-ish stereo echo. TONE closes a lowpass inside the loop so
+		// every repeat is darker than the last, the loop saturates softly so
+		// FEEDBACK past 100% blooms rather than explodes, and PING puts the
+		// input in on the left and crosses each repeat to the other side.
+		// TIME glides when it changes, the way a tape delay's does.
+		Engine_VibeComposer.keep(SynthDef(\vc_delay, { |in = 0, out = 0, duck = 0, dtime = 0.375, fdbk = 0.35, dtone = 3500,
+			ping = 0.6, dret = 0.8|
+			var lagt = 0.08;
+			var x = In.ar(in, 2);
+			var p = Lag.kr(ping, lagt), fb = Lag.kr(fdbk, lagt);
+			var mono = (x[0] + x[1]) * 0.5;
+			var src = [(x[0] * (1 - p)) + (mono * p), x[1] * (1 - p)];
+			var back = LocalIn.ar(2);
+			var cross = [(back[0] * (1 - p)) + (back[1] * p), (back[1] * (1 - p)) + (back[0] * p)];
+			// the loop already costs a block, so the delay is a block short of TIME
+			var dt = (Lag.kr(dtime, 0.25) - ControlDur.ir + (LFNoise2.kr(0.4) * 0.0003))
+				.clip(0.002, 2.9);
+			var d = DelayC.ar(src + (cross * fb), 3, dt);
+			d = LPF.ar(d, Lag.kr(dtone, lagt).clip(200, 18000));
+			d = HPF.ar(d, 60);
+			d = (d * 0.8).tanh * 1.25;
+			LocalOut.ar(d);
+			Out.ar(out, d * Lag.kr(dret, lagt) * (1 - In.kr(duck + 1)));
+		}));
+
+		// ---- SPRING: shared by every track ----
+		// a three-spring tank, after Parker and Valimaki's dispersive model.
+		// A spring is a waveguide that carries low frequencies SLOWER than
+		// high ones, so every echo arrives as a falling chirp -- the drip --
+		// and the echoes come back round every few tens of milliseconds as
+		// the wave runs end to end. Each spring here is a loop of:
+		//
+		//   a cascade of stretched allpasses  the dispersion: each one is
+		//                       (a + z^-K) / (1 + a z^-K), so below fs/2K
+		//                       the lows are held back more than the highs.
+		//                       DRIP is a: how far the lows lag, how long
+		//                       and how wet the chirp is
+		//   a lowpass           TONE, which also takes out the images the
+		//                       stretch puts above fs/2K
+		//   a delay             the rest of the transit, wobbling a little
+		//                       the way a spring swings in its can
+		//
+		// The springs are three lengths, so their echoes never line up.
+		// DWELL is the drive into the tank's input transducer, as on a
+		// Fender: more of it is louder, longer and dirtier. The lows are
+		// taken out first because a spring cannot hold them anyway, and the
+		// kick going in is what makes a real one crash.
+		Engine_VibeComposer.keep(SynthDef(\vc_spring, { |in = 0, out = 0, duck = 0, sdecay = 2.2, stone = 3800,
+			dwell = 0.4, drip = 0.5, sret = 0.8|
+			var lagt = 0.1;
+			var x = In.ar(in, 2);
+			var dw = Lag.kr(dwell, lagt);
+			var a = Lag.kr(drip, lagt).linlin(0, 1, 0.35, 0.82);
+			var nap = 30;
+			// K = 4 at 48k: the chirp lives below 6 kHz, where a spring's does
+			var apd = 4 / SampleRate.ir;
+			// AllpassN is (z^-K - g) / (1 - g z^-K) with g set by a decay
+			// time, so a positive decay time is a negative coefficient: the
+			// sign that holds the LOWS back, the way a spring does
+			var apdec = apd * -6.907755 / a.log;
+			var tone = Lag.kr(stone, lagt).clip(300, 9000);
+			var dec = Lag.kr(sdecay, lagt).max(0.1);
+			// the allpasses' delay at the middle of the band, which is part
+			// of each spring's transit as far as the decay is concerned
+			var disp = nap * apd * 0.5 * (1 + a) / (1 - a);
+			var drv = 1 + (dw.squared * 12);
+			var lens = [0.0367, 0.0431, 0.0503];
+			var ins, back, outs, l, r;
+
+			x = HPF.ar(HPF.ar(x, 170), 170);
+			x = LPF.ar(x, 5500);
+			x = (x * drv).tanh * drv.sqrt.reciprocal * 1.6;
+			ins = [x[0], (x[0] + x[1]) * 0.5, x[1]];
+			back = LocalIn.ar(3);
+			outs = 3.collect { |k|
+				var len = lens[k];
+				// the loop costs a block already
+				var dt = (len * (1 + (LFNoise2.kr(0.37 + (k * 0.21)) * 0.004))) - ControlDur.ir;
+				var g = 0.001 ** ((len + disp) / dec);
+				var v = ins[k] + (back[k] * g);
+				nap.do { v = AllpassN.ar(v, 0.0002, apd, apdec) };
+				v = LPF.ar(v, tone);
+				v = LPF.ar(v, (tone * 1.5).min(12000));
+				v = HPF.ar(v, 90);
+				// the steel saturates a little when it is driven hard
+				v = (v * 0.6).tanh * 1.6667;
+				DelayC.ar(v, 0.1, dt)
+			};
+			LocalOut.ar(outs);
+			// the middle spring in both sides, the outer two one each
+			l = outs[0] + (outs[1] * 0.6);
+			r = outs[2] + (outs[1] * 0.6);
+			Out.ar(out, [l, r] * 0.55 * Lag.kr(sret, lagt) * (1 - In.kr(duck + 1)));
+		}));
+
+		// ---- DUCK: the sidechain ----
+		// every strip writes its own envelope (before the fader, after the
+		// mute) to a control bus; this picks the SOURCE track's and turns it
+		// into a gain reduction for the other seven strips and, by FX, for
+		// the delay and spring returns. It runs after the strips, so a strip
+		// hears the duck a block late: about a millisecond, nothing to hear.
+		// It writes reductions, not gains, so a bus nobody writes is no duck.
+		//   out + 0  reduction for the strips (0 none, 1 silence)
+		//   out + 1  reduction for the returns
+		//   out + 2  the source track, 1-8, 0 off: that strip does not duck
+		Engine_VibeComposer.keep(SynthDef(\vc_duck, { |sc = 0, out = 0, scsrc = 0, scamt = 0, screl = 0.25, scfx = 0.5|
+			var on = scsrc > 0;
+			var env = Select.kr((scsrc - 1).clip(0, 7), In.kr(sc, 8)) * on;
+			// AMOUNT is depth in dB: all the way is -30 dB on a full hit
+			var db = (env * 3).clip(0, 1) * Lag.kr(scamt, 0.05) * -30;
+			// down fast, back up over RELEASE
+			var g = LagUD.kr(db.dbamp, Lag.kr(screl, 0.05), 0.004);
+			var red = 1 - g;
+			Out.kr(out, [red, red * Lag.kr(scfx, 0.05), scsrc]);
+		}));
+
+		// ---- PERFORM: the punch-ins ----
+		// Each one lives only while its pad is held: it reads the mix bus,
+		// replaces what is on it, and frees itself once let go. All of them
+		// fade in and out over a few milliseconds, so a punch never clicks.
+		// Lua works every time out from the tempo and sends seconds, as the
+		// generic a b c d; each def says what its four mean. They sit after
+		// the returns and before COLOUR, so the buss, the texture and the
+		// limiter are still the last word.
+		//
+		// The loop and tape-stop punch-ins play back the TAPE RECORDER: the
+		// mix written into a 30 second ring buffer all the time, with its
+		// write position on a control bus so a punch knows where "now" is.
+		// A reader starts a block behind the write head (LAT), which nobody
+		// can hear and keeps the interpolation off samples not yet written.
+
+		Engine_VibeComposer.keep(SynthDef(\vc_rec, { |in = 0, buf = 0, pos = 0|
+			var ph = Phasor.ar(0, 1, 0, BufFrames.kr(buf));
+			BufWr.ar(In.ar(in, 2), buf, ph);
+			Out.kr(pos, A2K.kr(ph));
+		}));
+
+		// The SAMPLER's recorder (hold S1, tap a step). While armed it
+		// writes its source into a ring all the time, so a take can begin a
+		// moment BEFORE the hit that started it. src: 0 inputs L+R, 1 L,
+		// 2 R, 3 the mix as you hear it, 4 one track's voices (tbus). With
+		// det on, the first time the level crosses thr it reports where the
+		// ring was, and sclang takes it from there (see sampBegin).
+		Engine_VibeComposer.keep(SynthDef(\vc_samp, { |inl = 0, inr = 0, mix = 0, tbus = 0, src = 0, buf = 0,
+				pos = 0, lvl = 0, det = 0, thr = 0.03|
+			var l = In.ar(inl), r = In.ar(inr), m = In.ar(mix, 2);
+			var sig = Select.ar(src.clip(0, 4),
+				[(l + r) * 0.5, l, r, (m[0] + m[1]) * 0.5, In.ar(tbus)]);
+			var ph = Phasor.ar(0, 1, 0, BufFrames.kr(buf));
+			var amp = Amplitude.ar(sig, 0.0002, 0.08);
+			BufWr.ar(sig, buf, ph);
+			Out.kr(pos, A2K.kr(ph));
+			Out.kr(lvl, Amplitude.kr(sig, 0.005, 0.25));
+			SendReply.ar(Trig1.ar((amp > thr) * (det > 0.5), 0.5), '/vc_samp_hit', ph);
+		}));
+
+		// LOOP: a = how far back from the press the loop starts (s), b = its
+		// length (s), c = where in it playback begins (s), d = rate, negative
+		// for reverse. REPEAT starts it on the last grid line with c the time
+		// since that line, so the first pass IS the live mix and only then
+		// does it come round. The hidden TAPE loops the last LENGTH and
+		// varispeeds it, gliding between rates the way tape does. Each pass
+		// is windowed over 3 ms where it wraps.
+		Engine_VibeComposer.keep(SynthDef(\vc_pf_loop, { |bus = 0, buf = 0, pos = 0, gate = 1, a = 0, b = 0.5, c = 0, d = 1|
+			var sr = SampleRate.ir, frames = BufFrames.kr(buf);
+			var p0 = Latch.kr(In.kr(pos), Impulse.kr(0));
+			var len = (Lag.kr(b, 0.05).max(0.005) * sr);
+			var rate = Lag.kr(d, 0.12);
+			var ph = (Sweep.ar(0, sr * rate) + (c * sr)).wrap(0, len);
+			var base = p0 - (Lag.kr(a, 0.05) * sr) - 64;
+			var fade = 0.003 * sr;
+			var win = (ph / fade).min((len - ph) / fade).clip(0, 1);
+			var wet = BufRd.ar(2, buf, (base + ph).wrap(0, frames), 1, 4) * win;
+			var dry = In.ar(bus, 2);
+			var env = EnvGen.kr(Env.asr(0.004, 1, 0.012), gate, doneAction: 2);
+			ReplaceOut.ar(bus, (dry * (1 - env)) + (wet * env));
+		}));
+
+		// STOP: tape stop and spin-back. The read head starts on the write
+		// head and its speed goes from 1 to b over a seconds: b = 0 is a
+		// tape stop, 0.5 a drop to half speed, below 0 a spin-back. Slower
+		// than the write head it falls behind it, so this is the live mix
+		// slowing down, not a loop. The top closes as it slows, and it fades
+		// out as it stops so nothing is left hanging on one sample.
+		Engine_VibeComposer.keep(SynthDef(\vc_pf_stop, { |bus = 0, buf = 0, pos = 0, gate = 1, a = 0.5, b = 0|
+			var sr = SampleRate.ir, frames = BufFrames.kr(buf);
+			var p0 = Latch.kr(In.kr(pos), Impulse.kr(0));
+			var rate = EnvGen.ar(Env([1, b], [a.max(0.01)], -3));
+			var idx = (p0 - 64 + Sweep.ar(0, sr * rate)).wrap(0, frames);
+			var amp = Select.ar(b < 0, [
+				(rate.abs * 3).clip(0, 1),
+				EnvGen.ar(Env([1, 1, 0], [a * 0.3, a * 0.7], -2))
+			]);
+			var wet = BufRd.ar(2, buf, idx, 1, 4);
+			var dry = In.ar(bus, 2);
+			var env = EnvGen.kr(Env.asr(0.004, 1, 0.012), gate, doneAction: 2);
+			wet = LPF.ar(wet, (rate.abs * 18000).clip(150, 20000)) * amp;
+			ReplaceOut.ar(bus, (dry * (1 - env)) + (wet * env));
+		}));
+
+		// GATE: chops the mix on the beat grid. a = a chop's length in
+		// beats, b = the length of a beat (s), c = where in the bar the press
+		// landed (beats), d = how much of each chop is open. Counted from
+		// the bar, so a new a while held stays on the grid.
+		Engine_VibeComposer.keep(SynthDef(\vc_pf_gate, { |bus = 0, gate = 1, a = 0.25, b = 0.5, c = 0, d = 0.5|
+			var beats = c + Sweep.ar(0, b.reciprocal);
+			var open = Lag.ar(((beats / a).frac < d), 0.0015);
+			var dry = In.ar(bus, 2);
+			var env = EnvGen.kr(Env.asr(0.004, 1, 0.012), gate, doneAction: 2);
+			ReplaceOut.ar(bus, dry * (1 - (env * (1 - open))));
+		}));
+
+		// CRUSH: a = bits, b = sample rate (Hz)
+		Engine_VibeComposer.keep(SynthDef(\vc_pf_crush, { |bus = 0, gate = 1, a = 8, b = 8000|
+			var dry = In.ar(bus, 2);
+			var q = 2 ** (Lag.kr(a, 0.02) - 1);
+			var wet = Latch.ar(dry, Impulse.ar(Lag.kr(b, 0.02)));
+			var env = EnvGen.kr(Env.asr(0.004, 1, 0.012), gate, doneAction: 2);
+			wet = (wet * q).round / q;
+			ReplaceOut.ar(bus, (dry * (1 - env)) + (wet * env * 0.9));
+		}));
+
+		// LOWPASS / HIGHPASS: a = cutoff (Hz), b = rq. A press sweeps in from
+		// wide open; a new cutoff while held glides there.
+		Engine_VibeComposer.keep(SynthDef(\vc_pf_lpf, { |bus = 0, gate = 1, a = 1000, b = 0.4|
+			var f = Lag.kr(a, 0.1);
+			var fc = f * ((20000 / f) ** EnvGen.kr(Env([1, 0], [0.15], -3)));
+			var dry = In.ar(bus, 2);
+			var env = EnvGen.kr(Env.asr(0.004, 1, 0.03), gate, doneAction: 2);
+			var wet = RLPF.ar(dry, fc.clip(30, 20000), b);
+			ReplaceOut.ar(bus, (dry * (1 - env)) + (wet * env));
+		}));
+
+		Engine_VibeComposer.keep(SynthDef(\vc_pf_hpf, { |bus = 0, gate = 1, a = 1000, b = 0.4|
+			var f = Lag.kr(a, 0.1);
+			var fc = f * ((20 / f) ** EnvGen.kr(Env([1, 0], [0.15], -3)));
+			var dry = In.ar(bus, 2);
+			var env = EnvGen.kr(Env.asr(0.004, 1, 0.03), gate, doneAction: 2);
+			var wet = RHPF.ar(dry, fc.clip(20, 18000), b);
+			ReplaceOut.ar(bus, (dry * (1 - env)) + (wet * env));
+		}));
+
+		// ECHO: a dub throw. While held the mix goes into a ping-pong echo;
+		// let go and the input closes but the echoes ring on, fading over c
+		// seconds before the synth frees. a = time (s), b = feedback.
+		Engine_VibeComposer.keep(SynthDef(\vc_pf_echo, { |bus = 0, gate = 1, a = 0.25, b = 0.6, c = 4|
+			var dry = In.ar(bus, 2);
+			var life = EnvGen.kr(Env.asr(0, 1, c, -4), gate, doneAction: 2);
+			var send = EnvGen.kr(Env.asr(0.003, 1, 0.01), gate);
+			var fb = LocalIn.ar(2);
+			var mono = (dry[0] + dry[1]) * 0.5 * send;
+			var d = DelayC.ar([mono + (fb[1] * b), fb[0] * b], 2, (a - ControlDur.ir).clip(0.005, 1.95));
+			d = LPF.ar(HPF.ar(d, 220), 5000);
+			d = (d * 0.9).tanh / 0.9;
+			LocalOut.ar(d);
+			ReplaceOut.ar(bus, dry + (d * life));
+		}));
+
+		// ---- COLOUR: the master ----
+		// BUSS, after Ableton's Drum Buss:
+		//   comp > drive > crunch > damp > transients > boom, then MIX
+		// then Pappus' colour stage: tilt > loss > envelope-following
+		// noise > wow, then a chorus and the level, always wet; BYPASS is
+		// the way out.
+		//
+		// Each stage is a synth of its own, working in place on the mix bus
+		// in signal order (colourStages), so that one whose knob is at zero
+		// can be paused: a SynthDef runs every UGen in it whether it is heard
+		// or not, and with everything at zero, as it starts, COLOUR ran some
+		// two hundred of them for nothing. A stage at zero passes the signal
+		// through untouched, so pausing it there changes nothing; see *want.
+		// The first stage keeps a copy of what came in on `dry`, for MIX,
+		// the noise's envelope and BYPASS.
+		Engine_VibeComposer.keep(SynthDef(\vc_c_in, { |bus = 0, dry = 0|
+			// the strips guard their own inputs, but the returns and the
+			// punch-ins land on this bus after them: a bad value here would
+			// wedge every filter below for good
+			var sig = In.ar(bus, 2).collect { |c| Select.ar(CheckBadValues.ar(c, 0, 0) > 0, [c, DC.ar(0)]) };
+			ReplaceOut.ar(bus, sig);
+			Out.ar(dry, sig);
+		}));
+
+		// ---- COMP ----
+		// one knob, the way Drum Buss has one button: a fast peak
+		// compressor whose threshold falls and ratio climbs together
+		// (-21 dB at 6:1 at the top), with most of the level made back
+		Engine_VibeComposer.keep(SynthDef(\vc_c_comp, { |bus = 0, comp = 0|
+			var sig = In.ar(bus, 2), cp = Lag.kr(comp, 0.08);
+			var mono = (sig[0] + sig[1]) * 0.5;
+			var cthr = 0.5 ** (cp * 3.5);
+			var cslope = (1 + (cp * 5)).reciprocal;
+			ReplaceOut.ar(bus, Compander.ar(sig, mono, cthr, 1, cslope, 0.001, 0.12)
+				* (cthr.reciprocal ** ((1 - cslope) * 0.7)));
+		}));
+
+		// ---- DRIVE ----
+		// three circuits, each with makeup fitted so a peak at -9 dB
+		// stays there: turning DRIVE mostly changes density, and the mix
+		// gets a few dB louder over the knob, not ten.
+		//   SOFT    waveshaping: a biased tanh, so the halves round off
+		//           differently and a little second harmonic comes up
+		//   MEDIUM  limiting: a hard-kneed limiter after a lift at 2.4k,
+		//           so the high mids push into it first
+		//   HARD    clipping after a low shelf, so the low end hits it
+		Engine_VibeComposer.keep(SynthDef(\vc_c_drive, { |bus = 0, drive = 0, drivetype = 1|
+			var sig = In.ar(bus, 2), dr = Lag.kr(drive, 0.08);
+			var dtype = (drivetype - 1).clip(0, 2);
+			var dg = 1 + (dr.squared * 30);
+			var half = dg * 0.36;
+			var sx = sig * dg;
+			var soft = ((sx + 0.15).tanh - 0.15.tanh) * (0.36 / ((half + 0.15).tanh - 0.15.tanh));
+			var mx = BPeakEQ.ar(sig, 2400, 0.9, dr * 7) * dg;
+			var med = (mx / (((mx.abs ** 4) + 1) ** 0.25)) * (0.36 / (half / (((half ** 4) + 1) ** 0.25)));
+			var hx = BLowShelf.ar(sig, 110, 1, dr * 9) * dg;
+			var hard = hx.clip2(1) * (0.36 / half.min(1));
+			var shaped = 2.collect { |c| Select.ar(dtype, [soft[c], med[c], hard[c]]) };
+			shaped = LPF.ar(LeakDC.ar(shaped), (18000 - (dr * 6000)) * (1 - (dtype * 0.1)));
+			ReplaceOut.ar(bus, XFade2.ar(sig, shaped, ((dr * 4).clip(0, 1) * 2) - 1));
+		}));
+
+		// ---- CRUNCH ----
+		// sine-shaped distortion on the mid-highs only: split at 1.4k,
+		// the top half through a sine shaper that folds over a little
+		// past its peak, the bottom left alone
+		Engine_VibeComposer.keep(SynthDef(\vc_c_crunch, { |bus = 0, crunch = 0|
+			var sig = In.ar(bus, 2), cn = Lag.kr(crunch, 0.08);
+			var lo = LPF.ar(LPF.ar(sig, 1400), 1400);
+			var hi = sig - lo;
+			var cg = 1 + (cn.squared * 16);
+			var chi = (hi * cg).clip2(2.2).sin * (0.25 / (cg * 0.25).clip(0, 1.5).sin);
+			ReplaceOut.ar(bus, lo + XFade2.ar(hi, chi, (cn.sqrt * 2) - 1));
+		}));
+
+		// ---- DAMP ----
+		Engine_VibeComposer.keep(SynthDef(\vc_c_damp, { |bus = 0, bussdamp = 20000|
+			ReplaceOut.ar(bus, LPF.ar(In.ar(bus, 2), Lag.kr(bussdamp, 0.08).clip(200, 20000)));
+		}));
+
+		// ---- TRANSIENTS ----
+		// above 100 Hz. A fast envelope over a slow one finds the
+		// attack; either way round TRANS adds attack, then positive
+		// lifts what follows (fuller) and negative takes it away
+		// (tighter, less room and rattle)
+		Engine_VibeComposer.keep(SynthDef(\vc_c_trans, { |bus = 0, trans = 0|
+			var sig = In.ar(bus, 2), tr = Lag.kr(trans, 0.08);
+			var tlo = LPF.ar(LPF.ar(sig, 100), 100);
+			var thi = sig - tlo;
+			var tmono = (thi[0] + thi[1]) * 0.5;
+			var fast = Amplitude.ar(tmono, 0.0005, 0.03);
+			var slow = Amplitude.ar(tmono, 0.02, 0.3);
+			var att = ((fast + 0.0003) / (slow + 0.0003)).ampdb.clip(0, 18);
+			var pres = (slow * 30).clip(0, 1);
+			var gdb = (att * tr.abs * 0.5) + (tr * 5 * (1 - (att / 6).clip(0, 1)) * pres);
+			ReplaceOut.ar(bus, tlo + (thi * gdb.clip(-18, 14).dbamp));
+		}));
+
+		// ---- BOOM ----
+		// a resonator at FREQ that every hit's low end rings, ringing
+		// for DECAY, soft-limited so a long one cannot run away
+		Engine_VibeComposer.keep(SynthDef(\vc_c_boom, { |bus = 0, boom = 0, boomfreq = 55, boomdecay = 0.4|
+			var sig = In.ar(bus, 2), bm = Lag.kr(boom, 0.08);
+			var bf = Lag.kr(boomfreq, 0.1);
+			var brq = (2.2 / (Lag.kr(boomdecay, 0.1) * bf)).clip(0.005, 1);
+			var bsrc = LPF.ar(LPF.ar((sig[0] + sig[1]) * 0.5, bf * 3), bf * 3);
+			var bring = (Resonz.ar(bsrc, bf, brq) * bm.squared * 12).tanh * 0.4;
+			ReplaceOut.ar(bus, sig + bring);
+		}));
+
+		// ---- MIX, then TILT ----
+		Engine_VibeComposer.keep(SynthDef(\vc_c_mix, { |bus = 0, dry = 0, bussmix = 1, ctilt = 0|
+			var bmix = Lag.kr(bussmix, 0.08), tl = Lag.kr(ctilt, 0.08);
+			var sig = (In.ar(dry, 2) * (1 - bmix)) + (In.ar(bus, 2) * bmix);
+			sig = BLowShelf.ar(sig, 900, 0.7, tl * -6);
+			ReplaceOut.ar(bus, BHiShelf.ar(sig, 900, 0.7, tl * 6));
+		}));
+
+		// ---- LOSS: a codec falling apart ----
+		// bins under a level-tracking threshold are thrown away and the
+		// bandwidth closes from the top. Mono, as joint stereo is at low
+		// bitrates. Sine window at hop 0.5 is exactly COLA.
+		Engine_VibeComposer.keep(SynthDef(\vc_c_loss, { |bus = 0, loss = 0|
+			var sig = In.ar(bus, 2), ls = Lag.kr(loss, 0.08).clip(0, 1);
+			var lmono = (sig[0] + sig[1]) * 0.5;
+			var lchain = FFT(LocalBuf(512).clear, lmono, 0.5, 0);
+			var lthr = Amplitude.kr(lmono, 0.02, 0.15) * 163 * ls.squared * 0.45;
+			var lossmono, ldry, lmix, lon;
+			lchain = PV_MagAbove(lchain, lthr);
+			lchain = PV_BrickWall(lchain, 0 - ((ls ** 2.2) * 0.86));
+			lossmono = IFFT(lchain);
+			// FFT > IFFT comes out one window less one control block late
+			// (448 samples at 512 / 64), measured. Delaying the dry side a
+			// whole window left it 64 samples (1.3 ms) off, a comb with
+			// notches every 750 Hz: LOSS flanged where the two blend evenly.
+			// DelayN rounds to a whole sample and an exact 448 sits on the
+			// edge (it came out 447; asking 449 gave 450), so ask for half a
+			// sample more: with nothing thrown away the blend nulls to -135 dB
+			ldry = DelayN.ar(sig, 0.05, (512 - BlockSize.ir + 0.5) / SampleRate.ir);
+			lmix = (ls * 1.6).clip(0, 1);
+			// that alignment is 9.3 ms of latency on everything, so with LOSS
+			// at zero the stage is left out altogether: the undelayed signal,
+			// crossfaded in and out as LOSS leaves and comes back to zero
+			lon = Lag.kr(loss > 0, 0.05);
+			ReplaceOut.ar(bus, (sig * (1 - lon))
+				+ (((ldry * (1 - lmix)) + ([lossmono, lossmono] * lmix)) * lon));
+		}));
+
+		// ---- NOISE ----
+		// riding the drums' own envelope, so it opens with every hit and
+		// N.DEC is how long it hangs on after
+		Engine_VibeComposer.keep(SynthDef(\vc_c_noise, { |bus = 0, dry = 0, noise = 0, noisetype = 2, noisedecay = 0.25, noisetone = 1200|
+			var d = In.ar(dry, 2), envref = 0.25;
+			var env = Amplitude.ar((d[0] + d[1]) * 0.5, 0.002, Lag.kr(noisedecay, 0.08)).clip(0, 1);
+			var nwash = 2.collect {
+				Select.ar((noisetype - 1).clip(0, 4), [
+					WhiteNoise.ar,
+					PinkNoise.ar * 1.6,
+					Dust2.ar(1800),
+					(Decay2.ar(Dust.ar(12), 0.0003, 0.004) * WhiteNoise.ar * 6) + Dust2.ar(200),
+					LPF.ar(HPF.ar(PinkNoise.ar * 2, 2000), 9000) * (1 + (LFNoise2.kr(3) * 0.3))
+				])
+			};
+			env = (envref * ((env / envref).max(0) ** 2)).clip(0, 1);
+			nwash = BPF.ar(nwash, Lag.kr(noisetone, 0.08).clip(60, 12000), 0.8) * 2.5;
+			ReplaceOut.ar(bus, In.ar(bus, 2) + (nwash * env * Lag.kr(noise, 0.08) * 4));
+		}));
+
+		// ---- WOW ----
+		// cubic depth: the bottom of the knob is the slow unsteadiness
+		// that stops a drum machine sounding rigid, only the top seasick.
+		// The half millisecond under the wobble (so it never asks for a
+		// negative delay) glides in as WOW leaves zero, and the stage
+		// crossfades in from the straight signal, so at zero it is no
+		// delay at all and can be paused.
+		Engine_VibeComposer.keep(SynthDef(\vc_c_wow, { |bus = 0, wow = 0|
+			var sig = In.ar(bus, 2), kw = Lag.kr(wow, 0.08).clip(0, 1);
+			var on = Lag.kr(wow > 0, 0.05);
+			var kwd = ((kw * 0.0012) + ((kw ** 3) * 0.026));
+			var kwf = (kw ** 4) * 0.006;
+			var kwm = (LFNoise2.kr([0.08 + (kw * 0.7), 0.067 + (kw * 0.55)]) * kwd)
+				+ (LFNoise2.kr([4.7, 6.1]) * kwf);
+			var wet = DelayC.ar(sig, 0.08, Lag.kr(((wow > 0) * 0.0005) + kwd, 0.3) + kwm);
+			ReplaceOut.ar(bus, (sig * (1 - on)) + (wet * on));
+		}));
+
+		// ---- CHORUS ----
+		// after the Juno's: each side through a bucket-brigade delay of a
+		// few milliseconds swept by a triangle, left and right swept the
+		// opposite way, so it widens as it thickens. DEPTH is how far it
+		// sweeps, RATE how fast. BBD is how much of the bucket brigade
+		// comes with it: the top rolling off, its compander rounding the
+		// peaks, a breath of clock hiss. CHORUS all the way is half and
+		// half, as the Juno's is.
+		Engine_VibeComposer.keep(SynthDef(\vc_c_chorus, { |bus = 0, chorus = 0, chrate = 0.5, chdepth = 0.5, chbbd = 0.3|
+			var lagt = 0.08, sig = In.ar(bus, 2);
+			var cm = Lag.kr(chorus, lagt), cb = Lag.kr(chbbd, lagt);
+			var cdt = 0.0035 + (LFTri.kr(Lag.kr(chrate, lagt), [0, 2]) * Lag.kr(chdepth, lagt) * 0.0025);
+			var cwet = DelayC.ar(sig, 0.01, cdt);
+			var cgn = 1 + (cb * 2);
+			cwet = LPF.ar(LPF.ar(cwet, 14000 * (0.22 ** cb)), 14000 * (0.22 ** cb));
+			cwet = ((cwet * cgn).tanh / cgn.tanh) + (PinkNoise.ar([1, 1]) * cb * 0.0015);
+			ReplaceOut.ar(bus, sig + ((cwet - sig) * cm * 0.5));
+		}));
+
+		// ---- the level, BYPASS and the way out ----
+		Engine_VibeComposer.keep(SynthDef(\vc_c_out, { |bus = 0, dry = 0, out = 0, ampBus = 0, outlvl = 1, bypass = 0|
+			var sig = In.ar(bus, 2) * Lag.kr(outlvl, 0.08), d = In.ar(dry, 2);
+			sig = [Select.ar(bypass, [sig[0], d[0]]), Select.ar(bypass, [sig[1], d[1]])];
+			// a safety, not a sound: Limiter delays by twice its window, so a
+			// 1 ms window keeps it to 2 ms (10 ms was 20 ms late)
+			sig = Limiter.ar(sig, 0.95, 0.001);
+			// and the last word before norns' own mixer: one NaN out of here
+			// lodges in its reverb and compressor, which outlive the script,
+			// and nothing makes a sound again until norns restarts
+			sig = sig.collect { |c| Select.ar(CheckBadValues.ar(c, 0, 0) > 0, [c, DC.ar(0)]) };
+			Out.kr(ampBus, Amplitude.kr((sig[0] + sig[1]) * 0.5, 0.01, 0.2));
+			Out.ar(out, sig);
+		}));
+
+		all = built;
+		built = nil;
+		if (add) { all.do(_.add) };
+		^all
+	}
+
+	// ---------------------------------------------------------------- alloc
+
+	// Building every SynthDef keeps sclang busy for a while (twice as long
+	// since every voice has a lean twin), so the first boot writes them to
+	// disk and every boot after loads them straight into the server. The
+	// folder is named for this file's contents and the SC version, so an
+	// edited engine builds afresh, and the folders of older ones go.
+	loadDefs {
+		var s = context.server;
+		var root = Platform.userHomeDir +/+ "dust/data/vibecomposer/defs";
+		var key = (File.readAllString(this.class.filenameSymbol.asString) ++ Main.version).hash.asHexString;
+		var dir = root +/+ key;
+		var defs, cached;
+		if (File.exists(dir +/+ "ok").not) {
+			defs = Engine_VibeComposer.buildDefs(false);
+			cached = try {
+				(root +/+ "*").pathMatch.do { |old|
+					(old +/+ "*").pathMatch.do { |f| File.delete(f) };
+					File.delete(old);
+				};
+				File.mkdir(dir);
+				defs.do { |d|
+					File.use(dir +/+ d.name ++ ".scsyndef", "wb", { |f| f.putAll(d.asBytes) });
+				};
+				File.use(dir +/+ "ok", "w", { |f| f.write(key) });
+				true
+			} { |err|
+				("vibecomposer: synthdefs not cached: " ++ err.errorString).postln;
+				false
+			};
+			// nowhere to keep them: straight to the server, as they are
+			if (cached.not) { defs.do { |d| d.send(s) }; s.sync; ^this };
+		};
+		s.sendMsg(\d_loadDir, dir);
+		s.sync;
+	}
+
+	// The wavetables (see SYNTH), next to this file, one buffer per (level,
+	// bank) in the file's own order, so a voice finds its table at
+	// tables[0] + (level * 8) + bank. Without them the engine still runs:
+	// the drums play and synth notes are ignored.
+	loadTables {
+		var s = context.server, n = 32 * 1025, sf, ok;
+		var path = this.class.filenameSymbol.asString.dirname +/+ "wavetables/vc_wavetables.wav";
+		sf = SoundFile.new;
+		ok = sf.openRead(path);
+		if (ok) { ok = (sf.numFrames == (48 * n)) and: { sf.numChannels == 1 }; sf.close };
+		if (ok.not) {
+			("vibecomposer: no wavetables at " ++ path ++ " -- synth tracks are silent").postln;
+			^this
+		};
+		tables = Buffer.allocConsecutive(48, s, n, 1);
+		s.sync;
+		tables.do { |b, i| b.read(path, i * n, n) };
+		s.sync;
+	}
+
+	alloc {
+		var s = context.server;
+
+		this.loadDefs;
+		this.loadTables;
+
+		tBus = Array.fill(nTracks, { Bus.audio(s, 1) });
+		hissBus = Bus.audio(s, nTracks);
+		driftBus = Bus.control(s, nTracks);
+		mixBus = Bus.audio(s, 2);
+		dryBus = Bus.audio(s, 2);
+		dlyBus = Bus.audio(s, 2);
+		sprBus = Bus.audio(s, 2);
+		posBus = Bus.control(s, 1);
+		meterBus = Bus.control(s, nTracks);
+		ampBus = Bus.control(s, 1);
+		scBus = Bus.control(s, nTracks);
+		duckBus = Bus.control(s, 3);
+		mlast = Array.fill(nTracks, { 0 });
+		naps = IdentityDictionary.new;
+		// the drums' spring sends, then the synth strips'
+		ssends = Array.fill(nTracks + nSynths, { 0 });
+
+		synBus = Array.fill(nSynths, { Bus.audio(s, 1) });
+		synHiss = Bus.audio(s, 1);
+		synLfoBus = Bus.control(s, nSynths);
+		synDriftBus = Bus.control(s, nSynths);
+		synMeterBus = Bus.control(s, nSynths);
+		synScBus = Bus.control(s, nSynths);
+		smlast = Array.fill(nSynths, { 0 });
+		synArgs = Array.fill(nSynths, { IdentityDictionary.new });
+		synVoices = Array.fill(nSynths, { List.new });
+		synHeld = Array.fill(nSynths, { List.new });
+		synMonoOn = Array.fill(nSynths, { false });
+
+		// the LFOs ahead of every voice, the voices (drums, then a group
+		// per synth track) ahead of the strips
+		lfoGroup = Group.new(context.xg, \addToHead);
+		voiceGroup = Group.after(lfoGroup);
+		synParent = Group.after(voiceGroup);
+		synGroups = Array.fill(nSynths, { Group.tail(synParent) });
+		stripGroup = Group.after(synParent);
+		fxGroup = Group.after(stripGroup);
+		perfGroup = Group.after(fxGroup);
+		colourGroup = Group.after(perfGroup);
+		sGroup = Group.after(colourGroup);   // last: MIX is what you hear
+
+		blank = Buffer.alloc(s, 2, 1);
+		bufs = Array.fill(nTracks, { blank });
+		args = Array.fill(nTracks, { IdentityDictionary.new });
+		live = Array.fill(nTracks, { List.new });
+		kits = Array.fill(nTracks, { 0 });
+		tape = Buffer.alloc(s, (s.sampleRate ? 48000) * 30, 2);
+		// 20 seconds of take, and room either side for the pre-roll
+		sRing = Buffer.alloc(s, (s.sampleRate ? 48000) * 22, 1);
+		sPosBus = Bus.control(s, 1);
+		sLvlBus = Bus.control(s, 1);
+		s.sync;
+		sSynth = Synth.newPaused(\vc_samp, [\inl, context.in_b[0].index,
+			\inr, context.in_b[1].index, \mix, context.out_b.index,
+			\tbus, tBus[0].index, \buf, sRing.bufnum,
+			\pos, sPosBus.index, \lvl, sLvlBus.index], sGroup);
+		sHitFunc = OSCFunc({ |msg|
+			if (sState == 2) {
+				// 10 ms before the crossing: the attack that tripped it
+				this.sampBegin((msg[3] - (s.sampleRate * 0.01)).wrap(0, sRing.numFrames), sDur);
+			};
+		}, '/vc_samp_hit', s.addr);
+		punches = Array.newClear(8);
+		tails = List.new;
+
+		s.sync;
+
+		// the hiss ahead of the strips, hissing as they did until lua says
+		hissS = Synth(\vc_hiss, [\out, hissBus.index], stripGroup);
+		naps[hissS] = [true, 0, false];
+		strips = nTracks.collect { |i|
+			Synth(\vc_strip, [\in, tBus[i].index, \out, mixBus.index, \hbus, hissBus.index + i,
+				\meter, meterBus.index + i, \dbus, dlyBus.index, \sbus, sprBus.index,
+				\idx, i + 1, \sc, scBus.index + i, \duck, duckBus.index,
+				\drift, driftBus.index + i],
+				stripGroup, \addToTail)
+		};
+		// the DUCK first in the fx group: after every strip, before the returns
+		duckS = Synth(\vc_duck, [\sc, scBus.index, \out, duckBus.index], fxGroup);
+		delayS = Synth(\vc_delay, [\in, dlyBus.index, \out, mixBus.index,
+			\duck, duckBus.index], fxGroup, \addToTail);
+		// asleep until a track sends to it
+		springS = Synth.newPaused(\vc_spring, [\in, sprBus.index, \out, mixBus.index,
+			\duck, duckBus.index], fxGroup, \addToTail);
+		naps[springS] = [false, 0, false];
+		// the recorder first, then the stages in signal order
+		recS = Synth(\vc_rec, [\in, mixBus.index, \buf, tape.bufnum, \pos, posBus.index], perfGroup);
+		stages = 8.collect { Group.tail(perfGroup) };
+		// every stage that has a knob starts asleep: they all start at zero
+		colourS = colourStages.collect { |st|
+			var ca = [\bus, mixBus.index, \dry, dryBus.index, \out, context.out_b.index,
+				\ampBus, ampBus.index];
+			var n;
+			if (st[1].isNil) { n = Synth(st[0], ca, colourGroup, \addToTail) } {
+				n = Synth.newPaused(st[0], ca, colourGroup, \addToTail);
+				naps[n] = [false, 0, false];
+			};
+			n
+		};
+
+		// the synth tracks' LFOs and strips: the drum strips' def, after
+		// them, idx 9-16 (never a DUCK source, so always ducked by one)
+		synLfos = nSynths.collect { |i|
+			Synth(\vc_lfo, [\out, synLfoBus.index + i], lfoGroup, \addToTail)
+		};
+		synStrips = nSynths.collect { |i|
+			Synth(\vc_strip, [\in, synBus[i].index, \out, mixBus.index, \hbus, synHiss.index,
+				\meter, synMeterBus.index + i, \dbus, dlyBus.index, \sbus, sprBus.index,
+				\idx, nTracks + i + 1, \sc, synScBus.index + i, \duck, duckBus.index,
+				\drift, synDriftBus.index + i, \level, 0.8, \pan, 0, \warmth, 0],
+				stripGroup, \addToTail)
+		};
+
+		this.addCommands;
+		this.addPolls;
+	}
+
+	trig { arg t, vel, pitch, decm, smix;
+		var syn, list, a, lean;
+		if (t < 0 or: { t >= nTracks }) { ^nil };
+		list = live[t];
+		// the lean twin whenever neither the noise nor a sample is heard
+		a = args[t];
+		lean = ((a[\nlvl] ? 0) == 0) and: { (a[\ngrain] ? 0) == 0 }
+			and: { ((a[\slvl] ? 0) == 0) or: { bufs[t] === blank } };
+		if (chokes[t] == 1) {
+			list.do { |n| n.set(\gate, 0) };
+			list.clear;
+		} {
+			while { list.size >= 6 } { list.removeAt(0).set(\gate, 0) };
+		};
+		syn = Synth((if (lean) { leanDefs } { defs })[kits[t]][t], a.getPairs ++ [
+			\out, tBus[t].index, \vel, vel, \pitch, pitch, \decm, decm, \smix, smix,
+			\buf, bufs[t].bufnum, \an, analog, \drift, driftBus.index + t
+		], voiceGroup);
+		list.add(syn);
+		syn.onFree({ list.remove(syn) });
+	}
+
+	addCommands {
+		// set(track, argName, value): the next hit on that track uses it
+		this.addCommand(\set, "isf", { |msg|
+			var t = msg[1].asInteger;
+			if (t >= 0 and: { t < nTracks }) { args[t][msg[2].asSymbol] = msg[3] };
+		});
+
+		// trig(track, velocity, pitch offset, decay multiplier, synth/sample mix)
+		this.addCommand(\trig, "iffff", { |msg|
+			this.trig(msg[1].asInteger, msg[2], msg[3], msg[4], msg[5]);
+		});
+
+		// sample(track, path): mono, the first channel. The old buffer is
+		// freed late enough that a cymbal still ringing on it finishes.
+		this.addCommand(\sample, "is", { |msg|
+			var t = msg[1].asInteger, path = msg[2].asString;
+			if (t >= 0 and: { t < nTracks } and: { File.exists(path) }) {
+				Buffer.readChannel(context.server, path, channels: [0], action: { |b|
+					var old = bufs[t];
+					bufs[t] = b;
+					if (old !== blank) { SystemClock.sched(10, { old.free; nil }) };
+				});
+			};
+		});
+
+		this.addCommand(\sampleClear, "i", { |msg|
+			var t = msg[1].asInteger;
+			var old;
+			if (t >= 0 and: { t < nTracks }) {
+				old = bufs[t];
+				bufs[t] = blank;
+				if (old !== blank) { SystemClock.sched(10, { old.free; nil }) };
+			};
+		});
+
+		// strip(track, name, value): level pan tilt mute drive warmth dsend rsend
+		this.addCommand(\strip, "isf", { |msg|
+			var t = msg[1].asInteger;
+			var k = msg[2].asSymbol;
+			if (t >= 0 and: { t < nTracks }) {
+				strips[t].set(k, msg[3]);
+				if (k == \ssend) { ssends[t] = msg[3]; this.wantSpring };
+			};
+		});
+
+		// colour(name, value): the stages share no names, so the whole
+		// group hears it, and the stage it belongs to wakes or sleeps
+		this.addCommand(\colour, "sf", { |msg|
+			var k = msg[1].asSymbol;
+			colourGroup.set(k, msg[2]);
+			colourStages.do { |st, i| if (st[1] == k) { this.want(colourS[i], msg[2] != 0) } };
+		});
+
+		// duck(name, value): scsrc (0 off, 1-8 a track) scamt screl scfx
+		this.addCommand(\duck, "sf", { |msg|
+			duckS.set(msg[1].asSymbol, msg[2]);
+		});
+
+		// fx(name, value): the delay's and the spring's names do not overlap,
+		// so both hear every message and each takes its own
+		this.addCommand(\fx, "sf", { |msg|
+			delayS.set(msg[1].asSymbol, msg[2]);
+			springS.set(msg[1].asSymbol, msg[2]);
+			if (msg[1].asSymbol == \sdecay) { sdecay = msg[2] };
+		});
+
+		// kit(track, kit): 0 WARM, 1 WOOD, 2 FM, 3 ADD, from the track's next hit.
+		// A voice still ringing on the old kit rings out.
+		this.addCommand(\kit, "ii", { |msg|
+			var t = msg[1].asInteger;
+			if (t >= 0 and: { t < nTracks }) { kits[t] = msg[2].asInteger.clip(0, defs.size - 1) };
+		});
+
+		// analog(amount): tolerance, drift, per-hit variance and VCA bend,
+		// 0 to 1. Takes effect from the next hit.
+		this.addCommand(\analog, "f", { |msg| analog = msg[1] });
+
+		// hiss(amount): every strip's VCA hiss, 0 to 1
+		this.addCommand(\hiss, "f", { |msg| hissS.set(\hiss, msg[1]); this.want(hissS, msg[1] > 0) });
+
+		// punch(stage, def, a, b, c, d): start a punch-in on a stage, letting
+		// go of whatever that stage was playing. def is the vc_pf_ name.
+		// The stages run in this order, whatever order they were pressed in:
+		//   0 REPEAT  1 SPEED  2 TAPE  3 GATE  4 CRUSH  5 LOWPASS  6 HIGHPASS  7 ECHO
+		this.addCommand(\punch, "isffff", { |msg|
+			var st = msg[1].asInteger;
+			if (st >= 0 and: { st < stages.size }) {
+				this.unpunch(st);
+				punches[st] = Synth(("vc_pf_" ++ msg[2]).asSymbol, [\bus, mixBus.index,
+					\buf, tape.bufnum, \pos, posBus.index,
+					\a, msg[3], \b, msg[4], \c, msg[5], \d, msg[6]], stages[st], \addToTail);
+			};
+		});
+
+		// punchSet(stage, a, b, c, d): move the stage's sounding punch-in
+		this.addCommand(\punchSet, "iffff", { |msg|
+			var n = punches[msg[1].asInteger.clip(0, 7)];
+			if (n.notNil) { n.set(\a, msg[2], \b, msg[3], \c, msg[4], \d, msg[5]) };
+		});
+
+		// unpunch(stage): let go
+		this.addCommand(\unpunch, "i", { |msg| this.unpunch(msg[1].asInteger) });
+
+		// ---- the SAMPLER (lib/sampler). A take is written to `path`, and
+		// lua loads it onto the track like any other file once sDone moves.
+		//
+		// sampArm(src, track, threshold, path): the recorder on, writing
+		// its ring, not yet taking. Again while armed, it moves the source.
+		this.addCommand(\sampArm, "iifs", { |msg|
+			var src = msg[1].asInteger.clip(0, 4);
+			var tb = tBus[msg[2].asInteger.clip(0, nTracks - 1)].index;
+			if (sState < 3) {
+				sPath = msg[4].asString;
+				sSynth.set(\src, src, \tbus, tb, \thr, msg[3]);
+				sSynth.run(true);
+				if (sState < 1) { sState = 1 };
+			};
+		});
+		// sampListen(seconds): take that long from the next hit
+		this.addCommand(\sampListen, "f", { |msg|
+			if (sState == 1 or: { sState == 2 }) {
+				sDur = msg[1].clip(0.01, 20);
+				sState = 2;
+				sSynth.set(\det, 1);
+			};
+		});
+		// sampStart(seconds): take that long from now
+		this.addCommand(\sampStart, "f", { |msg|
+			if (sState == 1 or: { sState == 2 }) {
+				this.sampBegin(sPosBus.getSynchronous, msg[1]);
+			};
+		});
+		// sampStop: end the take early, and keep it
+		this.addCommand(\sampStop, "", { |msg| this.sampFinish(sGen) });
+		// sampCancel: no take; a take being written still lands
+		this.addCommand(\sampCancel, "", { |msg|
+			if (sState < 4) { this.sampOff };
+		});
+
+		this.addCommand(\panic, "", { |msg|
+			live.do { |l| l.do { |n| n.set(\gate, 0) }; l.clear };
+			this.synPanic(-1);
+		});
+
+		// ---- the SYNTH tracks, 0-7 ----
+		//
+		// synSet(track, name, value): the track's next notes use it, and its
+		// sounding ones follow (a set on its voice group). Names: bank wave
+		// sub fine cut res f1r f1f f1c f1m f2r f2f f2c f2m f2w f2k lfd lft
+		// glide. f1m picks the next notes' SynthDef, so it never reaches a
+		// sounding one; anything else (an old project's FM keys) is kept and
+		// ignored by the server.
+		this.addCommand(\synSet, "isf", { |msg|
+			var t = msg[1].asInteger, k = msg[2].asSymbol;
+			if (t >= 0 and: { t < nSynths }) {
+				synArgs[t][k] = msg[3];
+				synGroups[t].set(k, msg[3]);
+			};
+		});
+
+		// synLfo(track, name, value): rate (Hz) or shape (0 SINE 1 TRI
+		// 2 SAW 3 RAMP 4 SQUARE 5 S+H)
+		this.addCommand(\synLfo, "isf", { |msg|
+			var t = msg[1].asInteger;
+			if (t >= 0 and: { t < nSynths }) { synLfos[t].set(msg[2].asSymbol, msg[3]) };
+		});
+
+		// synMono(track, on): mono legato with a held-note stack, or poly.
+		// A change lets go of whatever the track is playing.
+		this.addCommand(\synMono, "ii", { |msg|
+			var t = msg[1].asInteger, on = msg[2].asInteger > 0;
+			if (t >= 0 and: { t < nSynths } and: { synMonoOn[t] != on }) {
+				synMonoOn[t] = on;
+				synHeld[t].clear;
+				synVoices[t].do { |v| if (v[\gated]) { v[\gated] = false; v[\node].set(\gate, 0) } };
+			};
+		});
+
+		// synOn(track, note, velocity 0-1), synOff(track, note)
+		this.addCommand(\synOn, "iif", { |msg| this.synOn(msg[1].asInteger, msg[2], msg[3]) });
+		this.addCommand(\synOff, "ii", { |msg| this.synOff(msg[1].asInteger, msg[2]) });
+
+		// synStrip(track, name, value): level pan tilt drive warmth dsend
+		// ssend mute, as strip
+		this.addCommand(\synStrip, "isf", { |msg|
+			var t = msg[1].asInteger, k = msg[2].asSymbol;
+			if (t >= 0 and: { t < nSynths }) {
+				synStrips[t].set(k, msg[3]);
+				if (k == \ssend) { ssends[nTracks + t] = msg[3]; this.wantSpring };
+			};
+		});
+
+		// synPanic(track): every voice on it gone in 12 ms; -1 every track
+		this.addCommand(\synPanic, "i", { |msg| this.synPanic(msg[1].asInteger) });
+	}
+
+	// Some nodes sleep while they have nothing to do: a COLOUR stage at
+	// zero, the SPRING with nothing sent to it. Wanted, a node runs at
+	// once; not wanted, it rings on for TAIL seconds and is then paused,
+	// which costs nothing, unless it is wanted again first. Paused, it
+	// still hears every set, so it wakes up where its knobs are.
+	want { arg node, wanted, tail = 0.5;
+		var st = naps[node], gen;
+		if (st.isNil) { ^nil };
+		if (wanted) {
+			st[1] = st[1] + 1;
+			st[2] = false;
+			if (st[0].not) { node.run(true); st[0] = true };
+		} {
+			if (st[0] and: { st[2].not }) {
+				st[2] = true;
+				gen = st[1];
+				SystemClock.sched(tail, {
+					// (and not if the engine has gone meanwhile)
+					if (naps.notNil and: { st[1] == gen }) { node.run(false); st[0] = false; st[2] = false };
+					nil
+				});
+			};
+		};
+	}
+
+	// the spring, once nothing is sent to it, rings out its DECAY first
+	// --------------------------------------------------------------- SYNTH
+
+	// a new voice on track T, last in its list; it takes itself out of the
+	// list when it frees
+	synVoice { arg t, note, vel;
+		var list = synVoices[t], v;
+		var a = synArgs[t];
+		var mode = (a[\f1m] ? 1).asInteger.clip(0, 2);
+		var lvl = Engine_VibeComposer.synLevel((note + ((a[\fine] ? 0) * 0.01)).midicps);
+		// the def for FG1's mode; arguments it does not have (an old
+		// project's FM keys, f1m itself) are ignored by the server
+		var node = Synth(Engine_VibeComposer.wtDefs[mode], a.getPairs ++ [
+			\tbase, tables[0].bufnum, \lvl, lvl,
+			\out, synBus[t].index, \gate, 1, \alive, 1, \note, note, \vel, vel,
+			\lfo, synLfoBus.index + t, \drift, synDriftBus.index + t, \an, analog
+		], synGroups[t]);
+		v = (node: node, note: note, gated: true);
+		list.add(v);
+		node.onFree({ list.remove(v) });
+		^v
+	}
+
+	// gone in 12 ms, out of the list at once so it is not counted again
+	synKill { arg t, v;
+		synVoices[t].remove(v);
+		v[\gated] = false;
+		v[\node].set(\alive, 0);
+	}
+
+	// POLY: up to synPoly voices a track, the oldest (sounding or ringing
+	// out) stolen first. MONO: one voice; a note while it is gated moves
+	// it there (gliding by GLIDE, no new attack), and the held notes are a
+	// stack, so letting go of the top one goes back to the one under it.
+	synOn { arg t, note, vel;
+		var list, cur;
+		if (t < 0 or: { t >= nSynths } or: { tables.isNil }) { ^nil };
+		list = synVoices[t];
+		if (synMonoOn[t]) {
+			synHeld[t].remove(note);
+			synHeld[t].add(note);
+			cur = list.detect { |v| v[\gated] };
+			if (cur.notNil) {
+				cur[\note] = note;
+				cur[\node].set(\note, note);
+			} {
+				list.copy.do { |v| this.synKill(t, v) };
+				this.synVoice(t, note, vel);
+			};
+		} {
+			while { list.size >= synPoly } { this.synKill(t, list.first) };
+			this.synVoice(t, note, vel);
+		};
+	}
+
+	synOff { arg t, note;
+		var list, cur, v, held;
+		if (t < 0 or: { t >= nSynths }) { ^nil };
+		list = synVoices[t];
+		if (synMonoOn[t]) {
+			held = synHeld[t];
+			if (held.includes(note).not) { ^nil };
+			held.remove(note);
+			cur = list.detect { |x| x[\gated] };
+			if (cur.isNil) { ^nil };
+			if (held.isEmpty) {
+				cur[\gated] = false;
+				cur[\node].set(\gate, 0);
+			} {
+				if (cur[\note] == note) {
+					cur[\note] = held.last;
+					cur[\node].set(\note, held.last);
+				};
+			};
+		} {
+			// the oldest still-gated voice playing that note
+			v = list.detect { |x| x[\gated] and: { x[\note] == note } };
+			if (v.notNil) { v[\gated] = false; v[\node].set(\gate, 0) };
+		};
+	}
+
+	synPanic { arg t;
+		var ts = if (t < 0) { (0 .. (nSynths - 1)) } { if (t < nSynths) { [t] } { [] } };
+		ts.do { |i|
+			synVoices[i].copy.do { |v| this.synKill(i, v) };
+			synHeld[i].clear;
+		};
+	}
+
+	wantSpring {
+		this.want(springS, ssends.any { |v| v > 0 }, (sdecay * 1.5) + 0.5);
+	}
+
+	// A punch-in that is let go of fades (an echo rings on) and frees
+	// itself. Only a few tails are kept: hammering ECHO must not pile up
+	// delay lines until the server runs out of memory.
+	unpunch { arg st;
+		var n;
+		if (st < 0 or: { st >= punches.size }) { ^nil };
+		n = punches[st];
+		if (n.isNil) { ^nil };
+		punches[st] = nil;
+		n.set(\gate, 0);
+		tails.add(n);
+		n.onFree({ tails.remove(n) });
+		while { tails.size > 4 } { tails.removeAt(0).free };
+	}
+
+	// ------------------------------------------------------------ sampler
+
+	// The recorder is one synth for the engine's life, paused while
+	// nothing is armed. Paused, its Phasor holds where it was and so does
+	// the position bus, so a take started the moment it wakes is measured
+	// from the right place -- a new synth would start at 0 under a bus
+	// still saying where the last one stopped.
+	sampOff {
+		sGen = sGen + 1;
+		sSynth.set(\det, 0);
+		sSynth.run(false);
+		sState = 0;
+	}
+
+	// a take from frame `start` of the ring, `dur` seconds long
+	sampBegin { arg start, dur;
+		var gen;
+		sGen = sGen + 1;
+		gen = sGen;
+		sSynth.set(\det, 0);
+		sStart = start.asInteger;
+		sDur = dur.clip(0.01, 20);
+		sT0 = Main.elapsedTime;
+		sState = 3;
+		SystemClock.sched(sDur, { this.sampFinish(gen); nil });
+	}
+
+	// Copy the take out of the ring (round the end if it wraps), bring it
+	// up to just under full scale, round off both ends so it neither
+	// clicks in nor out, and write it. The ring is 22 s, the longest take
+	// 20 s, so the write head is nowhere near the take while it is copied.
+	sampFinish { arg gen;
+		var s = context.server, frames = sRing.numFrames, n, path = sPath;
+		if (gen != sGen or: { sState != 3 }) { ^nil };
+		sGen = sGen + 1;
+		n = (sPosBus.getSynchronous.asInteger - sStart).wrap(0, frames);
+		if (n < 64) { this.sampOff; ^nil };
+		sState = 4;
+		Routine {
+			var b = Buffer.alloc(s, n, 1), first = (frames - sStart).min(n);
+			var fi = 48.min(n.div(4)), fo = 480.min(n.div(4));
+			var c = Condition.new, vin, vout;
+			s.sync;
+			sRing.copyData(b, 0, sStart, first);
+			if (n > first) { sRing.copyData(b, first, 0, n - first) };
+			s.sync;
+			sSynth.run(false);
+			b.normalize(0.9);
+			s.sync;
+			b.getn(0, fi, { |v| vin = v; c.unhang });
+			c.hang;
+			b.getn(n - fo, fo, { |v| vout = v; c.unhang });
+			c.hang;
+			b.setn(0, vin.collect { |x, i| x * (i / fi) },
+				n - fo, vout.collect { |x, i| x * (1 - ((i + 1) / fo)) });
+			s.sync;
+			b.write(path, "wav", "int24");
+			s.sync;
+			b.free;
+			sDone = sDone + 1;
+			sState = 0;
+		}.play(SystemClock);
+	}
+
+	// One bus read shared by all eight meter polls: they fire as a batch,
+	// so the read is cached for a few milliseconds.
+	addPolls {
+		nTracks.do { |i|
+			this.addPoll(("meter" ++ (i + 1)).asSymbol, {
+				var now = Main.elapsedTime;
+				if ((now - mtime) > 0.005) {
+					mlast = meterBus.getnSynchronous(nTracks);
+					mtime = now;
+				};
+				mlast[i]
+			});
+		};
+		this.addPoll(\outamp, { ampBus.getSynchronous });
+		// the synth tracks' meters, synmeter1-8, read the same way
+		nSynths.do { |i|
+			this.addPoll(("synmeter" ++ (i + 1)).asSymbol, {
+				var now = Main.elapsedTime;
+				if ((now - smtime) > 0.005) {
+					smlast = synMeterBus.getnSynchronous(nSynths);
+					smtime = now;
+				};
+				smlast[i]
+			});
+		};
+		// the sampler: its state, finished takes, the source's level and
+		// how far through a take it is
+		this.addPoll(\sampstate, { sState });
+		this.addPoll(\sampdone, { sDone });
+		this.addPoll(\samplvl, { if (sState > 0) { sLvlBus.getSynchronous } { 0 } });
+		this.addPoll(\sampprog, {
+			if (sState == 3) { ((Main.elapsedTime - sT0) / sDur).clip(0, 1) } { 0 }
+		});
+	}
+
+	free {
+		naps = nil;
+		live.do { |l| l.do(_.free) };
+		strips.do(_.free);
+		hissS.free;
+		delayS.free; springS.free; duckS.free;
+		recS.free; perfGroup.free; tape.free; posBus.free;
+		colourS.do(_.free);
+		sHitFunc.free; sSynth.free;
+		sGroup.free; sRing.free; sPosBus.free; sLvlBus.free;
+		// the synth tracks: their voices go with their groups
+		synVoices.do(_.clear);
+		synLfos.do(_.free); synStrips.do(_.free);
+		synParent.free; lfoGroup.free;
+		voiceGroup.free; stripGroup.free; fxGroup.free; colourGroup.free;
+		tBus.do(_.free);
+		hissBus.free;
+		driftBus.free;
+		mixBus.free; dryBus.free; dlyBus.free; sprBus.free; meterBus.free; ampBus.free;
+		scBus.free; duckBus.free;
+		synBus.do(_.free); synHiss.free;
+		synLfoBus.free; synDriftBus.free; synMeterBus.free; synScBus.free;
+		bufs.do { |b| if (b !== blank) { b.free } };
+		tables.do(_.free);
+		blank.free;
+	}
+}

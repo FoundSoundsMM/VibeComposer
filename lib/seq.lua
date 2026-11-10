@@ -28,6 +28,15 @@
 -- ahead as the slowest track, so what it plays is known before any other
 -- track's note on its line goes out.
 --
+-- THE DRUM MACHINE (lib/dd) rides the same coroutine: Q.follow gets every
+-- tick, start, pause, locate and stop, and its hits go into the same event
+-- list (kind 3), so both sequencers share one song position, one transport
+-- and one sync.
+--
+-- SYNC LEAD. Under Link or MIDI clock a synth track's notes (and the drums)
+-- go out PARAMS > SYNC > sync lead early, so the engine's audio, which
+-- leaves norns a few buffers late, is heard on the other machine's beat.
+--
 -- TRACK 8. When one of its steps plays, what it played is written into a
 -- history at that step's line. A following track looks its note up in the
 -- history at its own line when the note is SENT, not when it was prepared,
@@ -56,6 +65,7 @@ Q.join_t = 0         -- ... from this song tick
 Q.pending = nil      -- a snapshot waiting for its bar: { at, fn }
 Q.ext_spp = 0        -- the last song position pointer heard
 Q.rt = {}            -- per track, what is playing (not saved)
+Q.follow = nil       -- the drum machine, driven from here (lib/dd/seq)
 Q.dirty = true
 
 local ORDER = { K.MASTER }
@@ -96,6 +106,18 @@ function Q.next_bar(after)
 end
 
 function Q.abs_now() return math.floor((clock.get_beats() * K.PPQ) + 0.5) end
+
+-- the song's position in ticks, between ticks too (for the drums' timing)
+function Q.song_now() return (clock.get_beats() * K.PPQ) - Q.origin end
+
+-- the SYNC LEAD in ticks: nothing on the internal clock
+function Q.lead_ticks()
+  local src = source()
+  if src ~= LINK and src ~= MIDI then return 0 end
+  local ok, ms = pcall(function() return params:get("sync_lead") end)
+  if not ok or not ms or ms <= 0 then return 0 end
+  return (ms / 1000) / clock.get_beat_sec() * K.PPQ
+end
 
 -- ----------------------------------------------------------------- tracks
 
@@ -226,10 +248,15 @@ end
 
 -- ------------------------------------------------------------------ events
 
-local PRI = { [0] = 0, [2] = 1, [1] = 2 }  -- offs, then playheads, then ons
+local PRI = { [0] = 0, [2] = 1, [1] = 2, [3] = 2 }  -- offs, playheads, ons and hits
 
 local function push(e)
   e.pri = PRI[e.kind]
+  -- a synth track's notes lead the beat under an external clock
+  if e.rec and (St.track(e.rec.t).out or 1) == 1 then
+    local lead = Q.lead_ticks()
+    if lead > 0 then e.at = e.at - lead end
+  end
   -- how long the track is sounding for, so rain does not fall on a note
   if e.kind == 0 then
     local rt = Q.rt[e.rec.t]
@@ -239,6 +266,21 @@ local function push(e)
   local i = #ev
   while i >= 1 and (ev[i].at > e.at or (ev[i].at == e.at and ev[i].pri > e.pri)) do i = i - 1 end
   table.insert(ev, i + 1, e)
+end
+
+-- something else to happen at song tick `at` (the drums): fn(), unless a
+-- start, pause or stop comes first. line: the line it belongs to.
+function Q.push_fn(at, fn, line)
+  push({ at = at, kind = 3, fn = fn, line = line or at, drum = true })
+end
+
+-- the drums' own events from line `at` on, gone
+function Q.cancel_drum(at)
+  local keep = {}
+  for _, e in ipairs(Q.events) do
+    if not (e.drum and e.line >= at) then keep[#keep + 1] = e end
+  end
+  Q.events = keep
 end
 
 -- drop the note ons (not the offs: a note may already be sounding) of
@@ -487,7 +529,9 @@ end
 -- ------------------------------------------------------------------- fire
 
 local function fire(e)
-  if e.kind == 2 then
+  if e.kind == 3 then
+    e.fn()
+  elseif e.kind == 2 then
     Q.rt[e.t].ph = e.pos
     Q.rt[e.t].ph_line = e.line
     Q.dirty = true
@@ -501,7 +545,8 @@ local function fire(e)
     rt.sounding[n] = (rt.sounding[n] or 0) + 1
     rec.sent = n
     if not tr.mute then
-      rec.k, rec.tok = O.on(tr.dev, tr.ch, n, rec.vel)
+      local port, ch = O.dest(tr, rec.t)
+      rec.k, rec.tok = O.on(port, ch, n, rec.vel)
     end
     -- what the screen shows: the notes of the latest line
     if rt.last_line ~= rec.line or not rt.last then rt.last = {} end
@@ -537,6 +582,7 @@ function Q.process(t)
       Q.rt[i].queued = nil
       Q.reset_track(i, math.max(p.at, t))
     end
+    if Q.follow then Q.follow.restart(math.max(p.at, t)) end
   end
 
   local lmax = Q.la_max()
@@ -563,6 +609,9 @@ function Q.process(t)
       guard = guard + 1
     end
   end
+
+  -- the drums put this tick's hits in alongside
+  if Q.follow then Q.follow.process(t) end
 
   local g = Q.gen
   while Q.events[1] and Q.events[1].at < t + 1 - 1e-9 do
@@ -626,6 +675,7 @@ function Q.begin(x, t0)
   Q.origin = x - t0
   Q.t = t0 - 1
   Q.playing, Q.paused = true, false
+  if Q.follow then Q.follow.begin(t0) end
   Q.dirty = true
 end
 
@@ -647,6 +697,7 @@ function Q.locate(R)
     end
   end
   prune_hist(R)
+  if Q.follow then Q.follow.locate(R) end
   Q.t = R - 1
   Q.dirty = true
 end
@@ -707,6 +758,7 @@ function Q.pause()
   end
   if source() ~= MIDI then O.stop() end
   if source() == LINK and link_sync() then pcall(function() clock.link.stop() end) end
+  if Q.follow then Q.follow.pause() end
   Q.dirty = true
 end
 
@@ -728,6 +780,7 @@ function Q.stop()
   Q.hist = {}
   Q.t, Q.pause_t = -1, -1
   Q.reset_tracks()
+  if Q.follow then Q.follow.halt() end
   return was
 end
 

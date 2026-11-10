@@ -16,9 +16,21 @@ end
 local now = 0
 util = {
   clamp = function(v, lo, hi) return math.min(math.max(v, lo), hi) end,
+  round = function(v) return math.floor(v + 0.5) end,
   time = function() return now end,
   file_exists = function() return false end,
+  scandir = function() return { "808-BD.wav", "808-CH.wav", "808-SD.wav" } end,
 }
+_path = { audio = "/home/we/dust/audio/" }
+
+-- the engine: every command logged with its arguments and the beat
+local eng_log = {}
+engine = setmetatable({ name = "", commands = { synOn = {} } }, { __index = function(_, k)
+  return function(...)
+    eng_log[#eng_log + 1] = { cmd = k, args = { ... }, beat = clock.get_beats() }
+  end
+end })
+poll = { set = function() return nil end }
 
 -- ------------------------------------------------------------------ screen
 
@@ -32,8 +44,10 @@ end
 local SCREEN = {
   move = function(x, y) txt.x, txt.y = x, y end,
   font_size = function(n) txt.size = n end,
+  text_extents = function(s) return txt_w(s), txt.size end,
   text = function(s) box(s, txt.x) end,
   text_right = function(s) box(s, txt.x - txt_w(s)) end,
+  text_center = function(s) box(s, txt.x - (txt_w(s) / 2)) end,
 }
 screen = setmetatable({}, { __index = function(_, k)
   return function(...) if SCREEN[k] then return SCREEN[k](...) end end
@@ -172,6 +186,25 @@ norns = { state = { data = "/tmp/vc-test/" } }
 
 -- ------------------------------------------------------------------ params
 
+-- controlspec, enough to be real about raw and mapped values (the drums)
+controlspec = { new = function(lo, hi, warp, step, def, unit, quantum)
+  local c = { minval = lo, maxval = hi, warp = warp or "lin", step = step or 0,
+              default = def or lo, units = unit, quantum = quantum or 0.01 }
+  function c:map(r)
+    r = math.min(math.max(r, 0), 1)
+    local v
+    if self.warp == "exp" then v = self.minval * ((self.maxval / self.minval) ^ r)
+    else v = self.minval + ((self.maxval - self.minval) * r) end
+    if self.step > 0 then v = math.floor((v / self.step) + 0.5) * self.step end
+    return v
+  end
+  function c:unmap(v)
+    if self.warp == "exp" then return math.log(v / self.minval) / math.log(self.maxval / self.minval) end
+    return (v - self.minval) / (self.maxval - self.minval)
+  end
+  return c
+end }
+
 local PR = {}
 params = { lookup = {} }
 local function addp(id, p)
@@ -184,17 +217,39 @@ function params:add_group() end
 function params:add_option(id, _, opts, def) addp(id, { val = def or 1, lo = 1, hi = #opts }) end
 function params:add_number(id, _, lo, hi, def) addp(id, { val = def, lo = lo, hi = hi }) end
 function params:add_binary(id, _, _, def) addp(id, { val = def or 0, lo = 0, hi = 1 }) end
-function params:add_trigger(id) addp(id, { val = 0, lo = 0, hi = 1 }) end
+function params:add_trigger(id) addp(id, { val = 0, lo = 0, hi = 1, trig = true }) end
+function params:add_file(id, _, path) addp(id, { val = path }) end
+function params:add_control(id, _, cs) addp(id, { cs = cs, raw = cs:unmap(cs.default) }) end
 function params:set_action(id, f) PR[id].action = f end
-function params:get(id) return assert(PR[id], "no param " .. id).val end
+function params:get(id)
+  local p = assert(PR[id], "no param " .. id)
+  if p.cs then return p.cs:map(p.raw) end
+  return p.val
+end
+function params:get_raw(id) return assert(PR[id], "no param " .. id).raw end
+function params:set_raw(id, r)
+  local p = assert(PR[id], "no param " .. id)
+  p.raw = math.min(math.max(r, 0), 1)
+  if p.action then p.action(params:get(id)) end
+end
+function params:lookup_param(id)
+  local p = assert(PR[id], "no param " .. id)
+  return { controlspec = p.cs, get = function() return params:get(id) end }
+end
 function params:set(id, v)
   local p = assert(PR[id], "no param " .. id)
-  p.val = v
-  if p.action then p.action(v) end
+  if p.cs then p.raw = p.cs:unmap(v) else p.val = v end
+  if p.action then p.action(params:get(id)) end
 end
 function params:delta(id, d)
   local p = PR[id]
+  if p.cs then return params:set_raw(id, p.raw + (d * p.cs.quantum)) end
   params:set(id, math.min(math.max(p.val + d, p.lo), p.hi))
+end
+function params:bang()
+  for _, p in pairs(PR) do
+    if p.action and not p.trig then p.action(p.cs and p.cs:map(p.raw) or p.val) end
+  end
 end
 params:add_number("clock_tempo", "tempo", 1, 300, 120)
 params:add_option("clock_source", "source", { "internal", "midi", "link", "crow" }, 1)
@@ -207,6 +262,9 @@ params:set("clock_midi_out_1", 1)   -- the user had norns clocking port 1
 dofile(ROOT .. "/vibecomposer.lua")
 init()
 local V = vibecomposer
+-- the tests below this were written for MIDI tracks: every track MIDI,
+-- until the synth's own tests
+for t = 1, #V.state.d.tracks do V.state.track(t).out = 2 end
 local St, Q, G, P, Kb, N = V.state, V.seq, V.grid, V.pages, V.keys, V.snap
 local K = include("lib/const")
 local T = include("lib/theory")
@@ -504,6 +562,15 @@ ok(St.track(1).clips[1].steps[1] ~= nil, "snapshot brought the steps back")
 press(2, 8) press(11, 1) now = now + 0.7 N.tick(0.7) release(11, 1) release(2, 8)
 ok(not N.has(1), "snapshot deleted")
 ok(Q.playing, "STOP used as a modifier does not stop")
+-- STOP + track: clear that track's clip, keep playing
+ok(Q.playing, "still playing")
+St.clip(3).steps[1] = St.new_step(3, { 60 })
+St.clip(4).steps[1] = St.new_step(4, { 62 })
+press(2, 8) tap(3, 7) release(2, 8)
+ok(next(St.clip(3).steps) == nil, "STOP + track 3: its steps are gone")
+ok(St.clip(4).steps[1] ~= nil, "track 4 untouched")
+ok(Q.playing, "clearing does not stop the song")
+St.clip(4).steps = {}
 tap(2, 8)
 ok(not Q.playing, "STOP alone stops")
 -- hold SET + track: track settings
@@ -645,6 +712,59 @@ tap(10, 8)
 ok(Kb.note_at(11, 8) == 36, "octave down")
 tap(10, 7)
 
+-- MONO: new-note priority
+P.open("keys") P.lane.keys = 3 P.enc(2, 1)
+ok(St.track(G.sel).mono, "VOICE set to MONO for the selected track")
+frame("keys mono")
+local function notes_log()
+  local s = {}
+  for _, e in ipairs(log) do
+    if e.kind == "on" or e.kind == "off" then s[#s + 1] = e.kind .. e.a end
+  end
+  return table.concat(s, " ")
+end
+log = {}
+press(11, 8) press(13, 8)
+ok(notes_log() == "on48 off48 on50", "a new key cuts the old one: " .. notes_log())
+log = {}
+press(15, 8) release(15, 8)
+ok(notes_log() == "off50 on52 off52 on50", "let go: back to the newest key held: " .. notes_log())
+log = {}
+release(11, 8)
+ok(notes_log() == "", "an older key coming up sends nothing")
+release(13, 8)
+ok(notes_log() == "off50" and #Kb.pads == 0, "last key up: silent")
+local cm = St.clip(G.sel)
+cm.steps[2] = nil
+log = {}
+press(11, 8) press(12, 8) press(2, 1) release(2, 1) release(12, 8) release(11, 8)
+ok(cm.steps[2] and #cm.steps[2].notes == 1 and cm.steps[2].notes[1] == 49, "MONO: a step takes the newest key")
+ok(notes_log() == "on48 off48 on49 off49 on48 off48", "MONO round trip: " .. notes_log())
+-- MONO live record: a key that is cut ends its note there
+cm.steps, cm.len = {}, 16
+tap(3, 8)                                    -- REC
+tap(1, 8)                                    -- PLAY
+pump_beats(1)
+ok(Q.playing, "playing")
+local i0 = Q.rec_step(G.sel)
+press(11, 8)
+pump_beats(0.74)                             -- three steps of C
+press(13, 8)
+pump_beats(0.48)
+release(13, 8) release(11, 8)
+Q.stop()
+tap(3, 8)
+local s1 = cm.steps[i0]
+ok(s1 and s1.notes[1] == 48 and s1.len == 3, "MONO record: C held 3 steps, cut by D: len " .. tostring(s1 and s1.len))
+local s4 = cm.steps[i0 + 3]
+ok(s4 and s4.notes[1] == 50 and #s4.notes == 1, "MONO record: D on its own step")
+cm.steps = {}
+P.enc(2, -1)
+ok(not St.track(G.sel).mono, "back to POLY")
+log = {}
+press(11, 8) press(13, 8) release(11, 8) release(13, 8)
+ok(notes_log() == "on48 on50 off48 off50", "POLY keys still play together: " .. notes_log())
+
 -- record: stopped, step by step
 c1.steps, c1.len = {}, 8
 tap(3, 8)
@@ -673,10 +793,12 @@ ok(not G.rec, "REC off")
 P.open("track") P.lane.track = 2
 P.enc(2, 600)
 ok(c1.len == 512, "length goes to 512")
-key(3, 1) key(3, 1)
-ok(G.steppage == 3, "K3 pages on")
-key(2, 1)
-ok(G.steppage == 2, "K2 pages back")
+tap(2, 5)
+ok(G.steppage == 3, "row E: pad 2 is pages 3-4 (" .. G.steppage .. ")")
+tap(2, 5)
+ok(G.steppage == 4, "pad 2 again: page 4")
+tap(1, 5) tap(1, 5)
+ok(G.steppage == 2, "pad 1 twice: page 2")
 press(1, 1) release(1, 1)
 ok(c1.steps[33] ~= nil, "pressing on page 2 writes step 33")
 frame("track 512")
@@ -870,6 +992,262 @@ ok(N.last == 47, "pad 47 is the current snapshot")
 tap(16, 8)                                   -- the saved one still loads
 ok(Kb.mode == 2 and G.sel == 6, "pad 48 still loads over it")
 tap(8, 8)
+
+-- ------------------------------------------------------------------- synth
+
+-- from here on presses go through the scene router, as the grid's do
+local function press(x, y) V.grid_key(x, y, 1) end
+local function release(x, y) V.grid_key(x, y, 0) end
+local function tap(x, y) press(x, y) release(x, y) end
+local D = V.drum
+local Syn = V.synth
+local function eng(cmd, from)
+  local out = {}
+  for i = from or 1, #eng_log do
+    if eng_log[i].cmd == cmd then out[#out + 1] = eng_log[i] end
+  end
+  return out
+end
+
+Q.stop()
+if G.settings then tap(8, 8) end
+St.d.swing = 50
+G.select(1)
+local tr1 = St.track(1)
+tr1.out, tr1.mute, tr1.oct = 1, false, 0
+tr1.tpl, tr1.prob, tr1.rain, tr1.swing = {}, 100, 0, 0
+St.clip(1).steps = {}
+St.clip(1).len, St.clip(1).speed, St.clip(1).dir = 16, 1, 1
+for t = 2, K.NTRACKS do St.track(t).mute = true end
+-- a new project's tracks are synths
+ok(St.new().tracks[3].out == 1, "a new track plays the synth")
+ok(St.fill({ tracks = { { clips = {} } } }).tracks[1].out == 2, "a track from before the synth stays MIDI")
+
+-- the keyboard plays the synth: synOn on track 0, no MIDI
+log = {}
+local e0 = #eng_log
+Kb.set_mode(1)
+press(11, 8) release(11, 8)
+local son, soff = eng("synOn", e0 + 1), eng("synOff", e0 + 1)
+local want = Kb.note_at(11, 8)
+ok(#son == 1 and son[1].args[1] == 0 and son[1].args[2] == want, "key plays synth track 1, its note")
+ok(#soff == 1 and soff[1].args[2] == want, "and lets it go")
+local midi_on = 0
+for _, e in ipairs(log) do if e.kind == "on" then midi_on = midi_on + 1 end end
+ok(midi_on == 0, "nothing on MIDI for a synth track")
+
+-- the sequencer plays it too, on the beat
+St.clip(1).steps = {}
+for _, i in ipairs({ 1, 5, 9, 13 }) do St.clip(1).steps[i] = St.new_step(1, { 60 }) end
+e0 = #eng_log
+tap(1, 8)
+pump_beats(4.2)
+local hits = eng("synOn", e0 + 1)
+ok(#hits >= 4, "four synth notes in four beats, got " .. #hits)
+if hits[2] then
+  local d = hits[2].beat - hits[1].beat
+  ok(math.abs(d - 1) < 0.02, string.format("a beat apart (%.3f)", d))
+end
+Q.stop()
+
+-- SYNTH page on H7: every lane draws, values reach the engine
+tap(7, 8)
+ok(P.page == "synth", "H7 opens SYNTH")
+for i = 1, #Syn.LANES do
+  P.lane.synth = i
+  frame("synth lane " .. i)
+end
+P.lane.synth = 1
+e0 = #eng_log
+P.enc(3, 10)
+local sets = eng("synSet", e0 + 1)
+ok(tr1.syn.wave == 35 and sets[1] and sets[1].args[2] == "wave" and math.abs(sets[1].args[3] - 0.35) < 1e-6,
+  "WAVE 35 sent as 0.35")
+P.enc(2, 1)
+ok(Syn.fmt(1, "bank") == "HARMONIC", "BANK steps through the banks")
+sets = eng("synSet", e0 + 1)
+ok(sets[#sets].args[2] == "bank" and sets[#sets].args[3] == 1, "bank 2 sent as 1")
+P.lane.synth = 3
+P.enc(2, -10)
+ok(Syn.fmt(1, "cut") ~= "OPEN", "CUTOFF closes from open")
+P.lane.synth = 11
+e0 = #eng_log
+P.enc(3, -10)
+local strip = eng("synStrip", e0 + 1)
+ok(strip[1] and strip[1].args[2] == "pan" and strip[1].args[3] < 0, "PAN goes to the strip")
+tap(7, 8)
+ok(P.page == "home", "H7 again: home")
+
+-- TRACK SETTINGS: OUTPUT first; MIDI sends MIDI again
+press(8, 8) tap(1, 7) release(8, 8)
+ok(P.page == "tset", "SET + track: settings")
+P.lane.tset = 1
+frame("tset synth")
+P.enc(2, 1)
+ok(tr1.out == 2, "OUTPUT to MIDI")
+P.lane.tset = 4
+frame("tset lane 4")
+log = {}
+press(11, 8) release(11, 8)
+midi_on = 0
+for _, e in ipairs(log) do if e.kind == "on" then midi_on = midi_on + 1 end end
+ok(midi_on == 1, "a MIDI track plays MIDI")
+P.lane.tset = 1
+P.enc(2, -1)
+ok(tr1.out == 1, "back to SYNTH")
+P.open("home")
+if G.settings then tap(8, 8) end
+
+-- SET + step: the clip's length, as on the drum grid
+press(8, 8) tap(4, 2) release(8, 8)
+ok(St.clip(1).len == 12, "SET + step 12: length 12 (" .. St.clip(1).len .. ")")
+ok(not G.settings, "and SET did not toggle the session view")
+St.clip(1).len = 16
+
+-- ------------------------------------------------------------------ scenes
+
+local DSt = D.St
+local function dframe(where)
+  redraw()
+  check_text(where)
+  V.grid_redraw()
+end
+key(3, 1)
+ok(V.scene() == 2, "K3: the drums")
+dframe("drum main")
+-- a drum pattern: BD1 on every beat, SNR on 2 and 4
+DSt.select(1)
+for _, i in ipairs({ 1, 5, 9, 13 }) do tap(i, 1) end
+ok(DSt.tracks[1].steps[5] and DSt.tracks[1].steps[5].on, "drum steps placed from the grid")
+tap(4, 7)
+ok(DSt.sel == 4, "row G selects the drum track")
+tap(5, 1) tap(13, 1)
+-- drums and the synth together, one PLAY
+e0 = #eng_log
+tap(1, 8)
+pump_beats(4.1)
+ok(Q.playing and DSt.playing, "one PLAY runs both")
+local trigs = eng("trig", e0 + 1)
+local kicks = {}
+for _, e in ipairs(trigs) do if e.args[1] == 0 then kicks[#kicks + 1] = e end end
+ok(#kicks >= 4, "four kicks, got " .. #kicks)
+local syn = eng("synOn", e0 + 1)
+if kicks[1] and syn[1] then
+  ok(math.abs(kicks[1].beat - syn[1].beat) < 0.02,
+    string.format("kick and synth note land together (%.3f / %.3f)", kicks[1].beat, syn[1].beat))
+end
+for k = 2, #kicks do
+  ok(math.abs((kicks[k].beat - kicks[k - 1].beat) - 1) < 0.02, "kick " .. k .. " a beat on")
+end
+local snr = 0
+for _, e in ipairs(trigs) do if e.args[1] == 3 then snr = snr + 1 end end
+ok(snr >= 2, "snare on 2 and 4, got " .. snr)
+dframe("drum main playing")
+-- PLAY pauses both, STOP stops both
+tap(1, 8)
+ok(Q.paused and not DSt.playing, "PLAY again pauses the drums too")
+tap(1, 8)
+pump_beats(1)
+ok(Q.playing and DSt.playing, "and carries on")
+tap(2, 8)
+ok(not Q.playing and not DSt.playing, "STOP stops both")
+
+-- STOP held is CLEAR: STOP + step back to a plain hit, and no stop
+DSt.tracks[4].steps[5].vel = 50
+press(2, 8) tap(5, 1) release(2, 8)
+ok(DSt.tracks[4].steps[5].vel == 100, "STOP + step: a plain hit again")
+-- SET held is SHIFT: SET + step is the length
+press(8, 8) tap(12, 1) release(8, 8)
+ok(DSt.tracks[4].len == 12, "SET + step: drum length 12")
+ok(DSt.page == "main", "SET used as SHIFT does not open the session")
+DSt.tracks[4].len = 16
+
+-- a control: hold TC1 (F1) and turn: the template's COND / PROB
+press(1, 6)
+dframe("drum TC1")
+enc(3, -10)
+release(1, 6)
+ok(DSt.tracks[4].tpl.prob == 90, "TC1 E3 sets new steps' PROB")
+-- a sound control over a held step: a lock
+press(5, 1) press(1, 5) enc(2, 5) release(1, 5) release(5, 1)
+ok(DSt.tracks[4].steps[5].locks ~= nil, "T1 over a held step locks it")
+dframe("drum lock")
+-- SWING is the shared swing
+press(14, 8) enc(2, 6) dframe("drum swing") release(14, 8)
+ok(St.d.swing == 56, "drum SWING turns vibe composer's swing")
+St.d.swing = 50
+press(8, 6) enc(2, 20) dframe("drum rain") release(8, 6)
+ok(params:get("rain") > 0, "RAIN amount")
+params:set("rain", 0)
+-- MIX and SESSION faces
+tap(15, 8) dframe("drum mix")
+ok(DSt.page == "mix", "MIX")
+tap(15, 8)
+tap(8, 8)
+ok(DSt.page == "session", "SET on its own: drum session")
+dframe("drum session")
+tap(1, 2)
+ok(DSt.tracks[1].clip == 2, "a clip launches (stopped: at once)")
+tap(1, 1)
+press(2, 5) tap(3, 7) release(2, 5)
+ok(D.S.kit_of(3) == 2, "hold WOOD + track 3: track 3 on WOOD")
+press(1, 5) release(1, 5)
+ok(D.S.kit_of(3) == 1, "tap WARM: every track WARM")
+tap(8, 8)
+
+-- ------------------------------------------------------------------ colour
+
+key(3, 1)
+ok(V.scene() == 3 and DSt.page == "colour", "K3 again: COLOUR")
+dframe("colour")
+tap(2, 6)
+dframe("colour bank 2")
+press(1, 1)
+dframe("colour punch")
+release(1, 1)
+tap(1, 7)
+ok(St.track(1).mute, "COLOUR row G mutes melodic track 1")
+tap(1, 7)
+tap(9, 7)
+ok(DSt.tracks[1].mute, "and G9 mutes drum track 1")
+tap(9, 7)
+key(3, 1)
+ok(V.scene() == 1, "K3 round to MELODIC")
+key(2, 1)
+ok(V.scene() == 3, "K2 back to COLOUR")
+key(2, 1) key(2, 1)
+ok(V.scene() == 1, "K2 round to MELODIC")
+-- H16 on the drum grid is COLOUR
+key(3, 1)
+tap(16, 8)
+ok(V.scene() == 3, "drum COLOUR pad: the COLOUR scene")
+key(2, 1) key(2, 1)
+
+-- -------------------------------------------------------------- snapshots
+
+-- a snapshot holds the drums: save, change, load
+DSt.tracks[2].steps = { [3] = D.S.new_step() }
+params:set(DSt.pid(2, "level"), 0.3)
+if not G.settings then tap(8, 8) end
+press(11, 1) now = now + 0.7 N.tick(0.7) release(11, 1)
+ok(N.has(1), "snapshot 1 saved")
+DSt.tracks[2].steps = {}
+params:set(DSt.pid(2, "level"), 0.9)
+tap(11, 1)
+ok(DSt.tracks[2].steps[3] ~= nil, "the snapshot brought the drum pattern back")
+ok(math.abs(params:get(DSt.pid(2, "level")) - 0.3) < 0.01, "and the drum level")
+-- the same pads in the drum session view
+tap(8, 8)
+key(3, 1)
+tap(8, 8)
+DSt.tracks[2].steps = {}
+tap(11, 1)
+ok(DSt.tracks[2].steps[3] ~= nil, "the drum session view loads the same snapshot")
+-- the snapshots' bottom row is snapshots there, not SWING MIX COLOUR
+press(16, 8) now = now + 0.7 N.tick(0.7) release(16, 8)
+ok(N.has(48) and V.scene() == 2 and DSt.page == "session", "H16 in the drum session saves snapshot 48")
+tap(8, 8)
+key(2, 1)
 
 cleanup()
 ok(params:get("clock_midi_out_1") == 1, "norns clock out given back on exit")
